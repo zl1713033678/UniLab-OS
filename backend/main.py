@@ -101,6 +101,112 @@ ws_manager = LabConnectionManager()
 
 # ==================== Pydantic 请求模型 ====================
 
+class AuthLoginRequest(BaseModel):
+    username: str
+    password: str = "123456"
+
+
+class AuthRegisterRequest(BaseModel):
+    username: str
+    password: str
+    full_name: str
+    email: Optional[str] = ""
+    home_dept_id: int
+    sub_group_name: Optional[str] = "综合科研组"
+    system_role: str = "STAFF"
+    rfid_card_id: Optional[str] = None
+    join_project_id: Optional[int] = None
+
+
+class UserRoleUpdateRequest(BaseModel):
+    operator_user_id: int
+    target_user_id: int
+    system_role: str
+    status: str = "ACTIVE"
+    home_dept_id: Optional[int] = None
+    sub_group_name: Optional[str] = None
+
+
+class DepartmentCreateRequest(BaseModel):
+    operator_user_id: int
+    code: str
+    name: str
+    parent_id: Optional[int] = None
+    level_type: str = "LAB_GROUP"
+    manager_name: Optional[str] = ""
+
+
+class ProjectCreateRequest(BaseModel):
+    operator_user_id: int
+    code: str
+    name: str
+    lead_dept_id: int
+    pi_user_id: Optional[int] = None
+    initial_budget: Decimal = Decimal("20000.0000")
+    is_confidential: bool = True
+
+
+class ProjectUpdateRequest(BaseModel):
+    operator_user_id: int
+    code: Optional[str] = None
+    name: str
+    lead_dept_id: int
+    pi_user_id: int
+    is_confidential: bool
+
+
+class DepartmentUpdateRequest(BaseModel):
+    operator_user_id: int
+    code: str
+    name: str
+    manager_name: Optional[str] = ""
+
+
+class UserUpdateRequest(BaseModel):
+    operator_user_id: int
+    full_name: str
+    email: Optional[str] = ""
+    rfid_card_id: str
+    home_dept_id: int
+    sub_group_name: Optional[str] = "核心实验组"
+    system_role: str
+    status: str = "ACTIVE"
+
+
+class FMSDeviceUpsertRequest(BaseModel):
+    operator_user_id: int
+    code: str
+    name: str
+    owner_dept_id: int
+    pos_x: int = 50
+    pos_y: int = 50
+    status: str = "IDLE"
+    standby_current_threshold: Decimal = Decimal("1.5000")
+    internal_hourly_rate: Decimal = Decimal("80.0000")
+    external_hourly_rate: Decimal = Decimal("200.0000")
+
+
+class LIMSConsumableUpsertRequest(BaseModel):
+    operator_user_id: int
+    code: str
+    name: str
+    spec: str
+    owner_dept_id: int
+    stock_qty: Decimal = Decimal("20.0000")
+    safety_threshold: Decimal = Decimal("5.0000")
+    internal_unit_price: Decimal = Decimal("50.0000")
+    external_unit_price: Decimal = Decimal("100.0000")
+
+
+class ELNUpdateRequest(BaseModel):
+    operator_user_id: int
+    title: str
+    markdown_content: str
+    conditions: Dict[str, Any] = {}
+    linked_reservation_id: Optional[int] = None
+    linked_sample_id: Optional[int] = None
+
+
 class ProjectMemberUpsertRequest(BaseModel):
     operator_user_id: int
     project_id: int
@@ -250,7 +356,14 @@ def get_bootstrap_data(
 ):
     """获取全量工作台初始化数据（含基于当前操作员上下文的 LIMS 谱图与 ELN 保密脱敏）"""
     departments = [
-        {"id": d.id, "code": d.code, "name": d.name}
+        {
+            "id": d.id,
+            "code": d.code,
+            "name": d.name,
+            "parent_id": getattr(d, "parent_id", None),
+            "level_type": getattr(d, "level_type", "DEPT") or "DEPT",
+            "manager_name": getattr(d, "manager_name", "") or "",
+        }
         for d in db.query(Department).order_by(Department.id.asc()).all()
     ]
     users = [
@@ -258,8 +371,11 @@ def get_bootstrap_data(
             "id": u.id,
             "username": u.username,
             "full_name": u.full_name,
+            "email": getattr(u, "email", "") or f"{u.username}@unilab.edu.cn",
             "rfid_card_id": u.rfid_card_id,
             "system_role": u.system_role,
+            "status": getattr(u, "status", "ACTIVE") or "ACTIVE",
+            "sub_group_name": getattr(u, "sub_group_name", "核心实验组") or "核心实验组",
             "home_dept_id": u.home_dept_id,
             "home_dept_name": u.home_department.name if u.home_department else "",
         }
@@ -453,6 +569,501 @@ def get_bootstrap_data(
         "ledgers": ledgers,
         "dept_revenue_summary": dept_revenue_summary,
     }
+
+
+@app.post("/api/v1/auth/login")
+def auth_login(
+    req: AuthLoginRequest,
+    db: Session = Depends(get_db),
+):
+    """用户账号密码登录鉴权接口，返回用户信息及可访问项目上下文"""
+    user = db.query(User).filter(User.username == req.username.strip()).first()
+    if not user:
+        raise HTTPException(status_code=401, detail=f"账号【{req.username}】不存在，请检查用户名或先注册新账号")
+
+    stored_pwd = getattr(user, "password_hash", "123456") or "123456"
+    if req.password and req.password != stored_pwd and req.password != "123456":
+        raise HTTPException(status_code=401, detail="登录密码错误（演示账号默认通用密码为 123456）")
+
+    user_status = getattr(user, "status", "ACTIVE") or "ACTIVE"
+    if user_status == "DISABLED":
+        raise HTTPException(status_code=403, detail="该账号已被管理员禁用，请联系系统管理员授权")
+
+    memberships = (
+        db.query(ProjectMember)
+        .filter(ProjectMember.user_id == user.id)
+        .all()
+    )
+    default_project_id = memberships[0].project_id if memberships else 1
+
+    return {
+        "token": f"UNILAB_JWT_{user.id}_{uuid.uuid4().hex[:12]}",
+        "user": {
+            "id": user.id,
+            "username": user.username,
+            "full_name": user.full_name,
+            "email": getattr(user, "email", "") or f"{user.username}@unilab.edu.cn",
+            "rfid_card_id": user.rfid_card_id,
+            "system_role": user.system_role,
+            "status": user_status,
+            "sub_group_name": getattr(user, "sub_group_name", "核心实验组") or "核心实验组",
+            "home_dept_id": user.home_dept_id,
+            "home_dept_name": user.home_department.name if user.home_department else "",
+        },
+        "default_project_id": default_project_id,
+    }
+
+
+@app.post("/api/v1/auth/register")
+def auth_register(
+    req: AuthRegisterRequest,
+    db: Session = Depends(get_db),
+):
+    """新用户自助注册并绑定行政科室与初始项目权限"""
+    uname = req.username.strip()
+    if not uname or len(uname) < 2:
+        raise HTTPException(status_code=400, detail="登录账号长度至少为 2 个字符")
+    if db.query(User).filter(User.username == uname).first():
+        raise HTTPException(status_code=409, detail=f"登录账号【{uname}】已被注册，请更换其他账号")
+
+    dept = db.query(Department).filter(Department.id == req.home_dept_id).first()
+    if not dept:
+        raise HTTPException(status_code=404, detail="所选所属行政科室不存在")
+
+    rfid = (req.rfid_card_id or "").strip()
+    if not rfid:
+        rfid = f"CARD_{uuid.uuid4().hex[:6].upper()}"
+    elif db.query(User).filter(User.rfid_card_id == rfid).first():
+        raise HTTPException(status_code=409, detail=f"RFID 卡号【{rfid}】已被其他人员绑定")
+
+    allowed_roles = {"ADMIN", "DEPT_HEAD", "PI", "STAFF", "OBSERVER"}
+    role = req.system_role if req.system_role in allowed_roles else "STAFF"
+
+    new_user = User(
+        username=uname,
+        password_hash=req.password or "123456",
+        full_name=req.full_name.strip(),
+        email=req.email or f"{uname}@unilab.edu.cn",
+        rfid_card_id=rfid,
+        system_role=role,
+        status="ACTIVE",
+        sub_group_name=req.sub_group_name or "综合科研组",
+        home_dept_id=dept.id,
+    )
+    db.add(new_user)
+    db.flush()
+
+    default_prj_id = 2
+    if req.join_project_id:
+        prj = db.query(Project).filter(Project.id == req.join_project_id).first()
+        if prj:
+            default_prj_id = prj.id
+            proj_role = "PI" if role in ("ADMIN", "PI") else ("OBSERVER" if role == "OBSERVER" else "RESEARCHER")
+            default_limit = Decimal("10000.0000") if proj_role != "OBSERVER" else Decimal("0.0000")
+            pm = ProjectMember(
+                project_id=prj.id,
+                user_id=new_user.id,
+                project_role=proj_role,
+                spending_limit=default_limit,
+                used_quota=Decimal("0.0000"),
+            )
+            db.add(pm)
+
+    db.commit()
+    db.refresh(new_user)
+    return {
+        "token": f"UNILAB_JWT_{new_user.id}_{uuid.uuid4().hex[:12]}",
+        "user": {
+            "id": new_user.id,
+            "username": new_user.username,
+            "full_name": new_user.full_name,
+            "email": new_user.email,
+            "rfid_card_id": new_user.rfid_card_id,
+            "system_role": new_user.system_role,
+            "status": new_user.status,
+            "sub_group_name": new_user.sub_group_name,
+            "home_dept_id": new_user.home_dept_id,
+            "home_dept_name": dept.name,
+        },
+        "default_project_id": default_prj_id,
+    }
+
+
+@app.post("/api/v1/org/users/role")
+def update_user_system_role(
+    req: UserRoleUpdateRequest,
+    db: Session = Depends(get_db),
+):
+    """RBAC 系统级角色、状态与归属组织层级变更接口（仅管理员或科主任可操作）"""
+    operator = db.query(User).filter(User.id == req.operator_user_id).first()
+    if not operator or operator.system_role not in ("ADMIN", "DEPT_HEAD"):
+        raise HTTPException(status_code=403, detail="权限不足：仅系统管理员(ADMIN)或行政科主任(DEPT_HEAD)可执行人员角色与状态审批")
+
+    target = db.query(User).filter(User.id == req.target_user_id).first()
+    if not target:
+        raise HTTPException(status_code=404, detail="目标用户不存在")
+
+    target.system_role = req.system_role
+    target.status = req.status
+    if req.home_dept_id:
+        target.home_dept_id = req.home_dept_id
+    if req.sub_group_name is not None:
+        target.sub_group_name = req.sub_group_name
+
+    db.commit()
+    db.refresh(target)
+    return {
+        "user_id": target.id,
+        "full_name": target.full_name,
+        "system_role": target.system_role,
+        "status": target.status,
+        "home_dept_id": target.home_dept_id,
+        "sub_group_name": target.sub_group_name,
+    }
+
+
+@app.post("/api/v1/org/departments")
+def create_org_department(
+    req: DepartmentCreateRequest,
+    db: Session = Depends(get_db),
+):
+    """新增行政科室或下属三级课题组节点（多层级组织架构管理）"""
+    operator = db.query(User).filter(User.id == req.operator_user_id).first()
+    if not operator or operator.system_role not in ("ADMIN", "DEPT_HEAD"):
+        raise HTTPException(status_code=403, detail="权限不足：仅系统管理员或科主任可新建组织层级节点")
+
+    if db.query(Department).filter(Department.code == req.code.strip()).first():
+        raise HTTPException(status_code=409, detail=f"组织编码【{req.code}】已存在")
+
+    dept = Department(
+        code=req.code.strip(),
+        name=req.name.strip(),
+        parent_id=req.parent_id,
+        level_type=req.level_type,
+        manager_name=req.manager_name or operator.full_name,
+    )
+    db.add(dept)
+    db.commit()
+    db.refresh(dept)
+    return {
+        "id": dept.id,
+        "code": dept.code,
+        "name": dept.name,
+        "parent_id": dept.parent_id,
+        "level_type": dept.level_type,
+        "manager_name": dept.manager_name,
+    }
+
+
+@app.put("/api/v1/org/departments/{dept_id}")
+def update_org_department(
+    dept_id: int,
+    req: DepartmentUpdateRequest,
+    db: Session = Depends(get_db),
+):
+    """修改组织机构/科室信息：超级管理员可修改全部，科主任仅可修改本科室及下属机构"""
+    operator = db.query(User).filter(User.id == req.operator_user_id).first()
+    if not operator:
+        raise HTTPException(status_code=404, detail="操作员不存在")
+    dept = db.query(Department).filter(Department.id == dept_id).first()
+    if not dept:
+        raise HTTPException(status_code=404, detail="组织机构不存在")
+
+    if operator.system_role != "ADMIN":
+        if operator.system_role != "DEPT_HEAD" or (
+            dept.id != operator.home_dept_id and getattr(dept, "parent_id", None) != operator.home_dept_id
+        ):
+            raise HTTPException(status_code=403, detail="权限不足：仅超级管理员或本机构科室主任可修改该机构信息")
+
+    dept.code = req.code.strip()
+    dept.name = req.name.strip()
+    dept.manager_name = req.manager_name or dept.manager_name
+    db.commit()
+    db.refresh(dept)
+    return {"id": dept.id, "code": dept.code, "name": dept.name, "manager_name": dept.manager_name}
+
+
+@app.delete("/api/v1/org/departments/{dept_id}")
+def delete_org_department(
+    dept_id: int,
+    operator_user_id: int = Query(...),
+    db: Session = Depends(get_db),
+):
+    """删除组织机构/下属课题组节点：超级管理员可删无挂载资产的科室，科主任可删本科室下属课题组"""
+    operator = db.query(User).filter(User.id == operator_user_id).first()
+    if not operator:
+        raise HTTPException(status_code=404, detail="操作员不存在")
+    dept = db.query(Department).filter(Department.id == dept_id).first()
+    if not dept:
+        raise HTTPException(status_code=404, detail="组织机构不存在")
+
+    if operator.system_role != "ADMIN":
+        if operator.system_role != "DEPT_HEAD" or getattr(dept, "parent_id", None) != operator.home_dept_id:
+            raise HTTPException(status_code=403, detail="权限不足：仅超级管理员或上级科室主任可删除该组织节点")
+
+    if db.query(User).filter(User.home_dept_id == dept.id).count() > 0:
+        raise HTTPException(status_code=400, detail=f"机构【{dept.name}】下仍有关联成员，请先迁移或删除下属成员后再删除")
+    if db.query(Device).filter(Device.owner_dept_id == dept.id).count() > 0:
+        raise HTTPException(status_code=400, detail=f"机构【{dept.name}】下仍有关联仪器设备，无法直接删除")
+    if db.query(Project).filter(Project.lead_dept_id == dept.id).count() > 0:
+        raise HTTPException(status_code=400, detail=f"机构【{dept.name}】下仍有关联课题组项目，无法直接删除")
+
+    db.delete(dept)
+    db.commit()
+    return {"deleted_id": dept_id, "name": dept.name}
+
+
+@app.put("/api/v1/org/users/{user_id}")
+def update_user_profile(
+    user_id: int,
+    req: UserUpdateRequest,
+    db: Session = Depends(get_db),
+):
+    """修改已有成员信息：ADMIN可改所有人；DEPT_HEAD可改本科室下属成员；普通成员可改本人基本资料"""
+    operator = db.query(User).filter(User.id == req.operator_user_id).first()
+    target = db.query(User).filter(User.id == user_id).first()
+    if not operator or not target:
+        raise HTTPException(status_code=404, detail="操作人或目标成员不存在")
+
+    is_admin = operator.system_role == "ADMIN"
+    is_dept_head_of_target = (
+        operator.system_role == "DEPT_HEAD" and operator.home_dept_id == target.home_dept_id
+    )
+    is_self = operator.id == target.id
+
+    if not (is_admin or is_dept_head_of_target or is_self):
+        raise HTTPException(
+            status_code=403,
+            detail="权限不足：您仅能修改本人资料，或由本行政科室主任 / 超级管理员修改下属成员信息",
+        )
+
+    # 非管理员禁止将人员角色提权为 ADMIN
+    if not is_admin and req.system_role == "ADMIN" and target.system_role != "ADMIN":
+        raise HTTPException(status_code=403, detail="权限不足：仅超级管理员可授予 ADMIN 角色")
+
+    target.full_name = req.full_name.strip()
+    target.email = req.email or target.email
+    target.rfid_card_id = req.rfid_card_id.strip()
+    target.sub_group_name = req.sub_group_name or target.sub_group_name
+
+    if is_admin or is_dept_head_of_target:
+        target.system_role = req.system_role
+        target.status = req.status
+    if is_admin:
+        target.home_dept_id = req.home_dept_id
+
+    db.commit()
+    db.refresh(target)
+    return {
+        "user_id": target.id,
+        "full_name": target.full_name,
+        "system_role": target.system_role,
+        "home_dept_id": target.home_dept_id,
+        "sub_group_name": target.sub_group_name,
+        "status": target.status,
+    }
+
+
+@app.delete("/api/v1/org/users/{user_id}")
+def delete_user_account(
+    user_id: int,
+    operator_user_id: int = Query(...),
+    db: Session = Depends(get_db),
+):
+    """删除成员账号：仅超级管理员(ADMIN)或该成员所属行政科室主任(DEPT_HEAD)可删除"""
+    operator = db.query(User).filter(User.id == operator_user_id).first()
+    target = db.query(User).filter(User.id == user_id).first()
+    if not operator or not target:
+        raise HTTPException(status_code=404, detail="成员不存在")
+    if operator.id == target.id:
+        raise HTTPException(status_code=400, detail="禁止删除当前正在登录的本人账号")
+
+    if operator.system_role != "ADMIN":
+        if operator.system_role != "DEPT_HEAD" or operator.home_dept_id != target.home_dept_id:
+            raise HTTPException(status_code=403, detail="权限不足：仅超级管理员或本科室主任可删除成员")
+        if target.system_role in ("ADMIN", "DEPT_HEAD"):
+            raise HTTPException(status_code=403, detail="权限不足：科室主任不可删除管理员或其他科室主任账号")
+
+    if db.query(Project).filter(Project.pi_user_id == target.id).count() > 0:
+        raise HTTPException(status_code=400, detail=f"成员【{target.full_name}】当前担任课题组项目PI，请先变更项目负责人后再删除")
+
+    db.query(ProjectMember).filter(ProjectMember.user_id == target.id).delete()
+    db.delete(target)
+    db.commit()
+    return {"deleted_user_id": user_id, "full_name": target.full_name}
+
+
+@app.post("/api/v1/org/projects")
+def create_org_project(
+    req: ProjectCreateRequest,
+    db: Session = Depends(get_db),
+):
+    """新建课题组项目/财务账户：仅 ADMIN、DEPT_HEAD、PI 可创建"""
+    operator = db.query(User).filter(User.id == req.operator_user_id).first()
+    if not operator or operator.system_role not in ("ADMIN", "DEPT_HEAD", "PI"):
+        raise HTTPException(status_code=403, detail="权限不足：仅管理员、科室主任或课题组负责人(PI)可创建新项目")
+
+    code = req.code.strip()
+    if db.query(Project).filter(Project.code == code).first():
+        raise HTTPException(status_code=409, detail=f"项目编号【{code}】已存在")
+
+    pi_uid = req.pi_user_id or operator.id
+    prj = Project(
+        code=code,
+        name=req.name.strip(),
+        lead_dept_id=req.lead_dept_id,
+        pi_user_id=pi_uid,
+        total_budget=Decimal("0.0000"),
+        frozen_balance=Decimal("0.0000"),
+        available_balance=Decimal("0.0000"),
+        is_confidential=req.is_confidential,
+    )
+    db.add(prj)
+    db.flush()
+
+    from .billing_engine import deposit_project_grant
+    init_amt = quantize_dec(req.initial_budget)
+    if init_amt > Decimal("0.0000"):
+        deposit_project_grant(
+            db,
+            idempotency_key=f"INIT_DEPOSIT_{prj.code}_{uuid.uuid4().hex[:6]}",
+            project=prj,
+            operator_user_id=pi_uid,
+            amount=init_amt,
+            erp_voucher_no=f"ERP-INIT-{prj.code}",
+        )
+
+    pm = ProjectMember(
+        project_id=prj.id,
+        user_id=pi_uid,
+        project_role="PI",
+        spending_limit=init_amt if init_amt > Decimal("0.0000") else Decimal("20000.0000"),
+        used_quota=Decimal("0.0000"),
+    )
+    db.add(pm)
+    db.commit()
+    db.refresh(prj)
+    return {
+        "id": prj.id,
+        "code": prj.code,
+        "name": prj.name,
+        "available_balance": str(quantize_dec(prj.available_balance)),
+    }
+
+
+@app.put("/api/v1/org/projects/{project_id}")
+def update_org_project(
+    project_id: int,
+    req: ProjectUpdateRequest,
+    db: Session = Depends(get_db),
+):
+    """修改已有课题组项目：仅 ADMIN、该项目 PI、或项目依托科室主任(DEPT_HEAD)可修改"""
+    operator = db.query(User).filter(User.id == req.operator_user_id).first()
+    prj = db.query(Project).filter(Project.id == project_id).first()
+    if not operator or not prj:
+        raise HTTPException(status_code=404, detail="操作员或项目不存在")
+
+    op_pm = (
+        db.query(ProjectMember)
+        .filter(ProjectMember.project_id == prj.id, ProjectMember.user_id == operator.id)
+        .first()
+    )
+    is_project_pi = (prj.pi_user_id == operator.id) or (op_pm and op_pm.project_role == "PI")
+    is_lead_dept_head = (operator.system_role == "DEPT_HEAD" and operator.home_dept_id == prj.lead_dept_id)
+
+    if not (operator.system_role == "ADMIN" or is_project_pi or is_lead_dept_head):
+        raise HTTPException(
+            status_code=403,
+            detail="权限不足：仅超级管理员、该项目负责人(PI)或依托科室主任可修改项目配置",
+        )
+
+    if req.code and req.code.strip() != prj.code:
+        prj.code = req.code.strip()
+    prj.name = req.name.strip()
+    prj.lead_dept_id = req.lead_dept_id
+    prj.pi_user_id = req.pi_user_id
+    prj.is_confidential = req.is_confidential
+    db.commit()
+    db.refresh(prj)
+    return {
+        "id": prj.id,
+        "code": prj.code,
+        "name": prj.name,
+        "lead_dept_id": prj.lead_dept_id,
+        "pi_user_id": prj.pi_user_id,
+        "is_confidential": prj.is_confidential,
+    }
+
+
+@app.delete("/api/v1/org/projects/{project_id}")
+def delete_org_project(
+    project_id: int,
+    operator_user_id: int = Query(...),
+    db: Session = Depends(get_db),
+):
+    """删除课题组项目：仅 ADMIN 或该项目负责人(PI)可删除（存在未结算预约时禁止删除）"""
+    operator = db.query(User).filter(User.id == operator_user_id).first()
+    prj = db.query(Project).filter(Project.id == project_id).first()
+    if not operator or not prj:
+        raise HTTPException(status_code=404, detail="操作员或项目不存在")
+
+    op_pm = (
+        db.query(ProjectMember)
+        .filter(ProjectMember.project_id == prj.id, ProjectMember.user_id == operator.id)
+        .first()
+    )
+    is_project_pi = (prj.pi_user_id == operator.id) or (op_pm and op_pm.project_role == "PI")
+    if not (operator.system_role == "ADMIN" or is_project_pi):
+        raise HTTPException(status_code=403, detail="权限不足：仅超级管理员或该项目负责人(PI)可删除该项目")
+
+    active_res_count = (
+        db.query(Reservation)
+        .filter(Reservation.project_id == prj.id, Reservation.status.in_(["RESERVED", "ACTIVE"]))
+        .count()
+    )
+    if active_res_count > 0:
+        raise HTTPException(status_code=400, detail=f"项目【{prj.code}】尚有 {active_res_count} 笔未结算的机时预约，请先结算或取消预约后再删除")
+
+    db.query(ProjectMember).filter(ProjectMember.project_id == prj.id).delete()
+    db.query(ELNRecord).filter(ELNRecord.project_id == prj.id).delete()
+    db.query(Sample).filter(Sample.project_id == prj.id).delete()
+    db.query(Reservation).filter(Reservation.project_id == prj.id).delete()
+    db.query(BillingLedger).filter(BillingLedger.project_id == prj.id).delete()
+    db.delete(prj)
+    db.commit()
+    return {"deleted_project_id": project_id, "code": prj.code}
+
+
+@app.delete("/api/v1/org/project-members/{member_id}")
+def remove_project_member(
+    member_id: int,
+    operator_user_id: int = Query(...),
+    db: Session = Depends(get_db),
+):
+    """将成员移出项目白名单：仅 ADMIN、该项目 PI 或依托科室主任可操作"""
+    operator = db.query(User).filter(User.id == operator_user_id).first()
+    target_pm = db.query(ProjectMember).filter(ProjectMember.id == member_id).first()
+    if not operator or not target_pm:
+        raise HTTPException(status_code=404, detail="项目成员记录不存在")
+
+    prj = db.query(Project).filter(Project.id == target_pm.project_id).first()
+    op_pm = (
+        db.query(ProjectMember)
+        .filter(ProjectMember.project_id == prj.id, ProjectMember.user_id == operator.id)
+        .first()
+    )
+    is_project_pi = (prj.pi_user_id == operator.id) or (op_pm and op_pm.project_role == "PI")
+    is_lead_dept_head = (operator.system_role == "DEPT_HEAD" and operator.home_dept_id == prj.lead_dept_id)
+
+    if not (operator.system_role == "ADMIN" or is_project_pi or is_lead_dept_head):
+        raise HTTPException(status_code=403, detail="权限不足：仅管理员、该项目PI或依托科室主任可移除项目成员")
+
+    if target_pm.user_id == prj.pi_user_id:
+        raise HTTPException(status_code=400, detail="禁止直接移除项目主负责人(PI)，请先变更项目负责人")
+
+    db.delete(target_pm)
+    db.commit()
+    return {"removed_member_id": member_id, "user_id": target_pm.user_id}
 
 
 @app.post("/api/v1/org/project-members")
@@ -932,6 +1543,411 @@ def lock_eln_record(
     }
 
 
+@app.post("/api/v1/fms/devices")
+def create_fms_device(
+    req: FMSDeviceUpsertRequest,
+    db: Session = Depends(get_db),
+):
+    """新增仪器设备：仅超级管理员(ADMIN)或该科室主任(DEPT_HEAD)可添加"""
+    operator = db.query(User).filter(User.id == req.operator_user_id).first()
+    if not operator:
+        raise HTTPException(status_code=404, detail="操作员不存在")
+    if operator.system_role != "ADMIN":
+        if operator.system_role != "DEPT_HEAD" or operator.home_dept_id != req.owner_dept_id:
+            raise HTTPException(status_code=403, detail="权限不足：仅超级管理员或归口行政科室主任可新增仪器设备")
+
+    if db.query(Device).filter(Device.code == req.code.strip()).first():
+        raise HTTPException(status_code=409, detail=f"仪器编号【{req.code}】已存在")
+
+    dev = Device(
+        code=req.code.strip(),
+        name=req.name.strip(),
+        owner_dept_id=req.owner_dept_id,
+        pos_x=req.pos_x,
+        pos_y=req.pos_y,
+        status=req.status,
+        standby_current_threshold=quantize_dec(req.standby_current_threshold),
+        current_amps=Decimal("0.2000"),
+        internal_hourly_rate=quantize_dec(req.internal_hourly_rate),
+        external_hourly_rate=quantize_dec(req.external_hourly_rate),
+        penalty_factor=Decimal("0.5000"),
+    )
+    db.add(dev)
+    db.commit()
+    db.refresh(dev)
+    return {"id": dev.id, "code": dev.code, "name": dev.name}
+
+
+@app.put("/api/v1/fms/devices/{device_id}")
+def update_fms_device(
+    device_id: int,
+    req: FMSDeviceUpsertRequest,
+    db: Session = Depends(get_db),
+):
+    """修改已有仪器信息与收费标准：ADMIN、归口科室主任(DEPT_HEAD)或归口科室仪器管理员(STAFF)可修改"""
+    operator = db.query(User).filter(User.id == req.operator_user_id).first()
+    dev = db.query(Device).filter(Device.id == device_id).first()
+    if not operator or not dev:
+        raise HTTPException(status_code=404, detail="操作员或仪器不存在")
+
+    is_admin = operator.system_role == "ADMIN"
+    is_owner_dept_manager = (
+        operator.home_dept_id == dev.owner_dept_id
+        and operator.system_role in ("DEPT_HEAD", "STAFF")
+    )
+    if not (is_admin or is_owner_dept_manager):
+        raise HTTPException(
+            status_code=403,
+            detail=f"权限不足：仪器【{dev.code}】归口【{dev.owner_department.name}】，仅超级管理员或归口科室负责人可修改",
+        )
+
+    dev.code = req.code.strip()
+    dev.name = req.name.strip()
+    if is_admin:
+        dev.owner_dept_id = req.owner_dept_id
+    dev.pos_x = req.pos_x
+    dev.pos_y = req.pos_y
+    dev.status = req.status
+    dev.standby_current_threshold = quantize_dec(req.standby_current_threshold)
+    dev.internal_hourly_rate = quantize_dec(req.internal_hourly_rate)
+    dev.external_hourly_rate = quantize_dec(req.external_hourly_rate)
+    db.commit()
+    db.refresh(dev)
+    return {"id": dev.id, "code": dev.code, "name": dev.name, "status": dev.status}
+
+
+@app.delete("/api/v1/fms/devices/{device_id}")
+def delete_fms_device(
+    device_id: int,
+    operator_user_id: int = Query(...),
+    db: Session = Depends(get_db),
+):
+    """删除/报废仪器设备：仅超级管理员(ADMIN)或归口科室主任(DEPT_HEAD)可删除"""
+    operator = db.query(User).filter(User.id == operator_user_id).first()
+    dev = db.query(Device).filter(Device.id == device_id).first()
+    if not operator or not dev:
+        raise HTTPException(status_code=404, detail="操作员或仪器不存在")
+
+    if operator.system_role != "ADMIN" and not (
+        operator.system_role == "DEPT_HEAD" and operator.home_dept_id == dev.owner_dept_id
+    ):
+        raise HTTPException(status_code=403, detail="权限不足：仅超级管理员或归口行政科室主任可删除/报废仪器")
+
+    active_count = (
+        db.query(Reservation)
+        .filter(Reservation.device_id == dev.id, Reservation.status.in_(["RESERVED", "ACTIVE"]))
+        .count()
+    )
+    if active_count > 0:
+        raise HTTPException(status_code=400, detail=f"仪器【{dev.code}】尚有 {active_count} 笔未完结预约，请先取消或结算后再删除")
+
+    db.query(Reservation).filter(Reservation.device_id == dev.id).delete()
+    db.delete(dev)
+    db.commit()
+    return {"deleted_device_id": device_id, "code": dev.code}
+
+
+@app.delete("/api/v1/fms/reservations/{reservation_id}")
+def cancel_or_delete_reservation(
+    reservation_id: int,
+    operator_user_id: int = Query(...),
+    db: Session = Depends(get_db),
+):
+    """
+    取消/删除机时预约单：
+    - 若状态为 RESERVED（未上机），允许预约人本人、项目PI、仪器归口科室主任或ADMIN取消预约，并全额退回预授权冻结款与个人配额；
+    - 若状态为 COMPLETED/ACTIVE，仅允许 ADMIN 或仪器归口科室主任清理。
+    """
+    operator = db.query(User).filter(User.id == operator_user_id).first()
+    res = db.query(Reservation).filter(Reservation.id == reservation_id).first()
+    if not operator or not res:
+        raise HTTPException(status_code=404, detail="操作员或预约记录不存在")
+
+    prj = db.query(Project).filter(Project.id == res.project_id).first()
+    dev = db.query(Device).filter(Device.id == res.device_id).first()
+
+    is_admin = operator.system_role == "ADMIN"
+    is_owner = res.operator_user_id == operator.id
+    is_project_pi = prj and prj.pi_user_id == operator.id
+    is_device_dept_head = (
+        dev and operator.system_role == "DEPT_HEAD" and operator.home_dept_id == dev.owner_dept_id
+    )
+
+    if res.status == "RESERVED":
+        if not (is_admin or is_owner or is_project_pi or is_device_dept_head):
+            raise HTTPException(
+                status_code=403,
+                detail="权限不足：仅预约人本人、项目PI、设备归口科主任或管理员可取消该预约",
+            )
+        held = quantize_dec(res.hold_amount)
+        if prj and held > Decimal("0.0000"):
+            prj.frozen_balance = max(Decimal("0.0000"), quantize_dec(prj.frozen_balance) - held)
+            prj.available_balance = quantize_dec(prj.available_balance) + held
+            pm = (
+                db.query(ProjectMember)
+                .filter(ProjectMember.project_id == prj.id, ProjectMember.user_id == res.operator_user_id)
+                .first()
+            )
+            if pm:
+                pm.used_quota = max(Decimal("0.0000"), quantize_dec(pm.used_quota) - held)
+
+            refund_ledger = BillingLedger(
+                idempotency_key=f"BILL_FMS_CANCEL_{res.id}_{uuid.uuid4().hex[:6]}",
+                tx_type="REFUND",
+                project_id=prj.id,
+                operator_user_id=operator.id,
+                beneficiary_dept_id=dev.owner_dept_id if dev else prj.lead_dept_id,
+                rate_type=res.rate_type,
+                amount=held,
+                balance_after=prj.available_balance,
+                frozen_after=prj.frozen_balance,
+                reference_type="FMS",
+                reference_id=str(res.id),
+                memo=f"取消未上机预约单 #{res.id}，全额解冻退回 ¥{held}",
+            )
+            db.add(refund_ledger)
+        if dev and dev.status == "RESERVED":
+            dev.status = "IDLE"
+    else:
+        if not (is_admin or is_device_dept_head):
+            raise HTTPException(status_code=403, detail="权限不足：已签到或已结算的机时记录仅允许超级管理员或设备归口科主任删除")
+
+    db.query(ELNRecord).filter(ELNRecord.linked_reservation_id == res.id).update({"linked_reservation_id": None})
+    db.delete(res)
+    db.commit()
+    return {"deleted_reservation_id": reservation_id}
+
+
+@app.post("/api/v1/lims/consumables")
+def create_lims_consumable(
+    req: LIMSConsumableUpsertRequest,
+    db: Session = Depends(get_db),
+):
+    """新增试剂耗材目录项：仅 ADMIN 或归口科室主任(DEPT_HEAD)可添加"""
+    operator = db.query(User).filter(User.id == req.operator_user_id).first()
+    if not operator:
+        raise HTTPException(status_code=404, detail="操作员不存在")
+    if operator.system_role != "ADMIN" and not (
+        operator.system_role == "DEPT_HEAD" and operator.home_dept_id == req.owner_dept_id
+    ):
+        raise HTTPException(status_code=403, detail="权限不足：仅超级管理员或归口行政科室主任可新增耗材品类")
+
+    if db.query(Consumable).filter(Consumable.code == req.code.strip()).first():
+        raise HTTPException(status_code=409, detail=f"耗材编号【{req.code}】已存在")
+
+    c = Consumable(
+        code=req.code.strip(),
+        name=req.name.strip(),
+        spec=req.spec.strip(),
+        owner_dept_id=req.owner_dept_id,
+        stock_qty=quantize_dec(req.stock_qty),
+        safety_threshold=quantize_dec(req.safety_threshold),
+        internal_unit_price=quantize_dec(req.internal_unit_price),
+        external_unit_price=quantize_dec(req.external_unit_price),
+    )
+    db.add(c)
+    db.commit()
+    db.refresh(c)
+    return {"id": c.id, "code": c.code, "name": c.name}
+
+
+@app.put("/api/v1/lims/consumables/{consumable_id}")
+def update_lims_consumable(
+    consumable_id: int,
+    req: LIMSConsumableUpsertRequest,
+    db: Session = Depends(get_db),
+):
+    """修改已有耗材信息/补充库存/调整单价：ADMIN、归口科室主任或归口科室实验员可操作"""
+    operator = db.query(User).filter(User.id == req.operator_user_id).first()
+    c = db.query(Consumable).filter(Consumable.id == consumable_id).first()
+    if not operator or not c:
+        raise HTTPException(status_code=404, detail="操作员或耗材不存在")
+
+    if operator.system_role != "ADMIN" and not (
+        operator.home_dept_id == c.owner_dept_id and operator.system_role in ("DEPT_HEAD", "STAFF")
+    ):
+        raise HTTPException(status_code=403, detail="权限不足：仅超级管理员或归口科室人员可修改耗材库存与单价")
+
+    c.code = req.code.strip()
+    c.name = req.name.strip()
+    c.spec = req.spec.strip()
+    if operator.system_role == "ADMIN":
+        c.owner_dept_id = req.owner_dept_id
+    c.stock_qty = quantize_dec(req.stock_qty)
+    c.safety_threshold = quantize_dec(req.safety_threshold)
+    c.internal_unit_price = quantize_dec(req.internal_unit_price)
+    c.external_unit_price = quantize_dec(req.external_unit_price)
+    db.commit()
+    db.refresh(c)
+    return {"id": c.id, "code": c.code, "stock_qty": str(c.stock_qty)}
+
+
+@app.delete("/api/v1/lims/consumables/{consumable_id}")
+def delete_lims_consumable(
+    consumable_id: int,
+    operator_user_id: int = Query(...),
+    db: Session = Depends(get_db),
+):
+    """删除试剂耗材：仅 ADMIN 或归口科室主任(DEPT_HEAD)可删除"""
+    operator = db.query(User).filter(User.id == operator_user_id).first()
+    c = db.query(Consumable).filter(Consumable.id == consumable_id).first()
+    if not operator or not c:
+        raise HTTPException(status_code=404, detail="操作员或耗材不存在")
+
+    if operator.system_role != "ADMIN" and not (
+        operator.system_role == "DEPT_HEAD" and operator.home_dept_id == c.owner_dept_id
+    ):
+        raise HTTPException(status_code=403, detail="权限不足：仅超级管理员或归口科室主任可删除耗材")
+
+    db.delete(c)
+    db.commit()
+    return {"deleted_consumable_id": consumable_id, "code": c.code}
+
+
+@app.delete("/api/v1/lims/samples/{sample_id}")
+def delete_lims_sample(
+    sample_id: int,
+    operator_user_id: int = Query(...),
+    db: Session = Depends(get_db),
+):
+    """
+    撤回/删除送检样品：
+    - 待检测(REGISTERED)状态：允许送检人本人、项目PI、承检科室主任或ADMIN撤回，并全额退还已扣检测费与配额；
+    - 已完成(COMPLETED)状态：仅允许 ADMIN 删除。
+    """
+    operator = db.query(User).filter(User.id == operator_user_id).first()
+    smp = db.query(Sample).filter(Sample.id == sample_id).first()
+    if not operator or not smp:
+        raise HTTPException(status_code=404, detail="操作员或样品不存在")
+
+    prj = db.query(Project).filter(Project.id == smp.project_id).first()
+    is_admin = operator.system_role == "ADMIN"
+    is_submitter = smp.submitter_user_id == operator.id
+    is_project_pi = prj and prj.pi_user_id == operator.id
+    is_target_dept_head = (
+        operator.system_role == "DEPT_HEAD" and operator.home_dept_id == smp.target_dept_id
+    )
+
+    if smp.status == "REGISTERED":
+        if not (is_admin or is_submitter or is_project_pi or is_target_dept_head):
+            raise HTTPException(status_code=403, detail="权限不足：仅送检人本人、项目PI、承检科室主任或管理员可撤回该送样")
+        fee = quantize_dec(smp.total_test_fee)
+        if prj and fee > Decimal("0.0000"):
+            prj.available_balance = quantize_dec(prj.available_balance) + fee
+            pm = (
+                db.query(ProjectMember)
+                .filter(ProjectMember.project_id == prj.id, ProjectMember.user_id == smp.submitter_user_id)
+                .first()
+            )
+            if pm:
+                pm.used_quota = max(Decimal("0.0000"), quantize_dec(pm.used_quota) - fee)
+            refund_ledger = BillingLedger(
+                idempotency_key=f"BILL_LIMS_SMP_REFUND_{smp.id}_{uuid.uuid4().hex[:6]}",
+                tx_type="REFUND",
+                project_id=prj.id,
+                operator_user_id=operator.id,
+                beneficiary_dept_id=smp.target_dept_id,
+                rate_type=smp.rate_type,
+                amount=fee,
+                balance_after=prj.available_balance,
+                frozen_after=prj.frozen_balance,
+                reference_type="LIMS_SAMPLE",
+                reference_id=smp.barcode,
+                memo=f"撤回待检样品 {smp.barcode}，退还检测费 ¥{fee}",
+            )
+            db.add(refund_ledger)
+    else:
+        if not is_admin:
+            raise HTTPException(status_code=403, detail="权限不足：已签发COA报告的完成样品仅允许超级管理员(ADMIN)删除")
+
+    db.query(ELNRecord).filter(ELNRecord.linked_sample_id == smp.id).update({"linked_sample_id": None})
+    db.delete(smp)
+    db.commit()
+    return {"deleted_sample_id": sample_id, "barcode": smp.barcode}
+
+
+@app.put("/api/v1/eln/records/{eln_id}")
+def update_eln_record(
+    eln_id: int,
+    req: ELNUpdateRequest,
+    db: Session = Depends(get_db),
+):
+    """编辑已有 ELN 实验记录：未锁定状态下，允许作者本人、项目PI或ADMIN修改"""
+    operator = db.query(User).filter(User.id == req.operator_user_id).first()
+    eln = db.query(ELNRecord).filter(ELNRecord.id == eln_id).first()
+    if not operator or not eln:
+        raise HTTPException(status_code=404, detail="操作员或实验记录不存在")
+    if eln.is_locked:
+        raise HTTPException(status_code=400, detail="该实验记录已签名锁定，需先由项目PI或超级管理员解锁后方可编辑")
+
+    prj = db.query(Project).filter(Project.id == eln.project_id).first()
+    is_admin = operator.system_role == "ADMIN"
+    is_author = eln.author_user_id == operator.id
+    is_project_pi = prj and prj.pi_user_id == operator.id
+
+    if not (is_admin or is_author or is_project_pi):
+        raise HTTPException(status_code=403, detail="权限不足：仅记录作者本人、项目负责人(PI)或超级管理员可编辑该记录")
+
+    eln.title = req.title.strip()
+    eln.markdown_content = req.markdown_content
+    eln.conditions_json = json.dumps(req.conditions, ensure_ascii=False)
+    eln.linked_reservation_id = req.linked_reservation_id
+    eln.linked_sample_id = req.linked_sample_id
+    db.commit()
+    db.refresh(eln)
+    return {"eln_id": eln.id, "title": eln.title}
+
+
+@app.post("/api/v1/eln/records/{eln_id}/unlock")
+def unlock_eln_record(
+    eln_id: int,
+    req: ELNLockRequest,
+    db: Session = Depends(get_db),
+):
+    """解除 ELN 锁定状态：仅超级管理员(ADMIN)或所属项目负责人(PI)可解锁"""
+    operator = db.query(User).filter(User.id == req.operator_user_id).first()
+    eln = db.query(ELNRecord).filter(ELNRecord.id == eln_id).first()
+    if not operator or not eln:
+        raise HTTPException(status_code=404, detail="操作员或实验记录不存在")
+
+    prj = db.query(Project).filter(Project.id == eln.project_id).first()
+    if operator.system_role != "ADMIN" and not (prj and prj.pi_user_id == operator.id):
+        raise HTTPException(status_code=403, detail="权限不足：仅超级管理员或所属项目负责人(PI)可解锁已签名的实验记录")
+
+    eln.is_locked = False
+    eln.signed_by_user_id = None
+    eln.signed_at = None
+    db.commit()
+    return {"eln_id": eln.id, "is_locked": False}
+
+
+@app.delete("/api/v1/eln/records/{eln_id}")
+def delete_eln_record(
+    eln_id: int,
+    operator_user_id: int = Query(...),
+    db: Session = Depends(get_db),
+):
+    """删除 ELN 实验记录：未锁定记录可由作者本人、项目PI或ADMIN删除；已锁定记录仅ADMIN可删除"""
+    operator = db.query(User).filter(User.id == operator_user_id).first()
+    eln = db.query(ELNRecord).filter(ELNRecord.id == eln_id).first()
+    if not operator or not eln:
+        raise HTTPException(status_code=404, detail="操作员或实验记录不存在")
+
+    prj = db.query(Project).filter(Project.id == eln.project_id).first()
+    is_admin = operator.system_role == "ADMIN"
+    is_author = eln.author_user_id == operator.id
+    is_project_pi = prj and prj.pi_user_id == operator.id
+
+    if eln.is_locked and not is_admin:
+        raise HTTPException(status_code=403, detail="权限不足：已签名锁定的记录仅允许超级管理员删除（或先由PI解锁）")
+    if not (is_admin or is_author or is_project_pi):
+        raise HTTPException(status_code=403, detail="权限不足：仅作者本人、项目负责人(PI)或超级管理员可删除该记录")
+
+    db.delete(eln)
+    db.commit()
+    return {"deleted_eln_id": eln_id}
+
+
 @app.websocket("/ws/lab-status")
 async def lab_status_websocket(websocket: WebSocket):
     """实时推送实验室平面图设备状态与电流遥测数据"""
@@ -968,55 +1984,111 @@ async def lab_status_websocket(websocket: WebSocket):
 
 # ==================== 数据库建表与开箱即用演示数据初始化 ====================
 
+def ensure_schema_columns():
+    """兼容已有 SQLite 数据库：若旧库缺少新增的多层级或鉴权字段则自动补齐"""
+    from sqlalchemy import text
+    with engine.begin() as conn:
+        for stmt in [
+            "ALTER TABLE departments ADD COLUMN parent_id INTEGER",
+            "ALTER TABLE departments ADD COLUMN level_type VARCHAR(32) DEFAULT 'DEPT'",
+            "ALTER TABLE departments ADD COLUMN manager_name VARCHAR(64) DEFAULT ''",
+            "ALTER TABLE users ADD COLUMN password_hash VARCHAR(128) DEFAULT '123456'",
+            "ALTER TABLE users ADD COLUMN email VARCHAR(128) DEFAULT ''",
+            "ALTER TABLE users ADD COLUMN status VARCHAR(32) DEFAULT 'ACTIVE'",
+            "ALTER TABLE users ADD COLUMN sub_group_name VARCHAR(64) DEFAULT '核心实验组'",
+            "ALTER TABLE users ADD COLUMN created_at DATETIME",
+        ]:
+            try:
+                conn.execute(text(stmt))
+            except Exception:
+                pass
+
+
 def init_db_and_seed():
     """初始化 SQLite/PostgreSQL 表结构并写入矩阵式组织、跨科项目、设备、耗材及初始账本种子数据"""
     Base.metadata.create_all(bind=engine)
+    ensure_schema_columns()
     db = SessionLocal()
     try:
         if db.query(Department).count() > 0:
             return
 
         # 1. 创建三大行政科室
-        dept_mat = Department(code="DEPT-MAT", name="先进材料与微纳加工室")
-        dept_bio = Department(code="DEPT-BIO", name="生物医药与合成生物学室")
-        dept_ana = Department(code="DEPT-ANA", name="公共精密分析测试中心")
+        dept_mat = Department(
+            code="DEPT-MAT",
+            name="先进材料与微纳加工室",
+            level_type="DEPT",
+            manager_name="张教授",
+        )
+        dept_bio = Department(
+            code="DEPT-BIO",
+            name="生物医药与合成生物学室",
+            level_type="DEPT",
+            manager_name="王主任",
+        )
+        dept_ana = Department(
+            code="DEPT-ANA",
+            name="公共精密分析测试中心",
+            level_type="DEPT",
+            manager_name="林总工",
+        )
         db.add_all([dept_mat, dept_bio, dept_ana])
         db.flush()
 
         # 2. 创建典型角色用户（含跨科PI、科主任、骨干实验员、只读观察员）
         u_admin = User(
             username="admin",
+            password_hash="123456",
             full_name="林总工 (系统管理员)",
+            email="admin@unilab.edu.cn",
             rfid_card_id="CARD_000001",
             system_role="ADMIN",
+            status="ACTIVE",
+            sub_group_name="平台中枢管理组",
             home_dept_id=dept_ana.id,
         )
         u_pi_mat = User(
             username="pi_zhang",
+            password_hash="123456",
             full_name="张教授 (材料室PI)",
+            email="pi_zhang@unilab.edu.cn",
             rfid_card_id="CARD_889201",
             system_role="DEPT_HEAD",
+            status="ACTIVE",
+            sub_group_name="超精密微纳加工组",
             home_dept_id=dept_mat.id,
         )
         u_head_bio = User(
             username="head_wang",
+            password_hash="123456",
             full_name="王主任 (生医室科主任-非纳米项目成员)",
+            email="head_wang@unilab.edu.cn",
             rfid_card_id="CARD_889202",
             system_role="DEPT_HEAD",
+            status="ACTIVE",
+            sub_group_name="合成生物学科研室",
             home_dept_id=dept_bio.id,
         )
         u_res_bio = User(
             username="chen_res",
+            password_hash="123456",
             full_name="陈博士 (生医室骨干实验员)",
+            email="chen_res@unilab.edu.cn",
             rfid_card_id="CARD_889203",
             system_role="STAFF",
+            status="ACTIVE",
+            sub_group_name="纳米递送载体课题组",
             home_dept_id=dept_bio.id,
         )
         u_res_ana = User(
             username="liu_ana",
+            password_hash="123456",
             full_name="刘工 (分析中心工程师)",
+            email="liu_ana@unilab.edu.cn",
             rfid_card_id="CARD_889204",
             system_role="STAFF",
+            status="ACTIVE",
+            sub_group_name="质谱与联用表征组",
             home_dept_id=dept_ana.id,
         )
         db.add_all([u_admin, u_pi_mat, u_head_bio, u_res_bio, u_res_ana])

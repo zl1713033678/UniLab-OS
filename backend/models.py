@@ -43,12 +43,15 @@ def get_db():
 
 
 class Department(Base):
-    """行政科室表：管人、管设备资产、管耗材，并作为内部跨科结算的受益方（贷方）"""
+    """行政科室与多层级组织架构表：支持 院/中心 -> 行政科室 -> 课题组/专业实验室 多级管理"""
     __tablename__ = "departments"
 
     id = Column(Integer, primary_key=True, index=True)
-    code = Column(String(32), unique=True, nullable=False, index=True, comment="科室编码")
-    name = Column(String(128), nullable=False, comment="科室名称")
+    code = Column(String(32), unique=True, nullable=False, index=True, comment="科室/组织编码")
+    name = Column(String(128), nullable=False, comment="科室/组织名称")
+    parent_id = Column(Integer, ForeignKey("departments.id"), nullable=True, comment="上级组织ID(支持多层级树)")
+    level_type = Column(String(32), nullable=False, default="DEPT", comment="层级类型: INSTITUTE(院级)/DEPT(行政科室)/LAB_GROUP(课题组)")
+    manager_name = Column(String(64), nullable=True, default="", comment="负责人姓名")
 
     users = relationship("User", back_populates="home_department")
     devices = relationship("Device", back_populates="owner_department")
@@ -56,15 +59,20 @@ class Department(Base):
 
 
 class User(Base):
-    """实验室人员表：唯一归属一个行政科室，可加入多个跨科室虚拟项目组"""
+    """实验室人员表：唯一归属一个行政科室，可加入多个跨科室虚拟项目组，支持注册登录与RBAC角色管理"""
     __tablename__ = "users"
 
     id = Column(Integer, primary_key=True, index=True)
     username = Column(String(64), unique=True, nullable=False, index=True, comment="登录账号")
+    password_hash = Column(String(128), nullable=False, default="123456", comment="登录密码凭证")
     full_name = Column(String(64), nullable=False, comment="姓名")
+    email = Column(String(128), nullable=True, default="", comment="电子邮箱")
     rfid_card_id = Column(String(64), unique=True, nullable=False, index=True, comment="实体RFID卡号")
-    system_role = Column(String(32), nullable=False, default="STAFF", comment="系统角色: ADMIN/DEPT_HEAD/STAFF")
+    system_role = Column(String(32), nullable=False, default="STAFF", comment="系统角色: ADMIN/DEPT_HEAD/PI/STAFF/OBSERVER")
+    status = Column(String(32), nullable=False, default="ACTIVE", comment="账号状态: ACTIVE/DISABLED/PENDING")
+    sub_group_name = Column(String(64), nullable=True, default="核心实验组", comment="所属三级课题组/专业组")
     home_dept_id = Column(Integer, ForeignKey("departments.id"), nullable=False, comment="所属行政科室ID")
+    created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
 
     home_department = relationship("Department", back_populates="users")
     project_memberships = relationship("ProjectMember", back_populates="user")
