@@ -72,3 +72,63 @@ UniLab-OS 面向科研院所与高校大型仪器共享平台，采用 **多层�
 | **送检样品 (`Sample`)** | 项目白名单内非观察员 | 承检科室人员或 `ADMIN` 签发/重签 COA 报告 | 待检测(`REGISTERED`)：送检人本人、项目 `PI`、承检 `DEPT_HEAD`、`ADMIN` 可撤回并自动退还检测费；已完成样品：仅 `ADMIN` 可删除 |
 | **实验记录 (`ELNRecord`)** | 项目白名单内非观察员 | 未锁定时：作者本人、项目 `PI`、`ADMIN` 可编辑；已锁定时：项目 `PI` 或 `ADMIN` 可解锁 | 未锁定时：作者本人、项目 `PI`、`ADMIN` 可删除；已锁定时：仅 `ADMIN` 可删除 |
 
+---
+
+## 3. 服务启停与内网部署运维指南
+
+### 3.1 本地开发调试启动（双端口热更新模式）
+注意命令需在 `UniLab-OS` 项目根目录下执行（若在上级目录执行需附带 `--app-dir` 参数）：
+
+1. **启动后端服务（端口 `8000`）**：
+   ```powershell
+   cd UniLab-OS
+   pip install -r backend/requirements.txt
+   python -m uvicorn backend.main:app --host 127.0.0.1 --port 8000 --reload
+   ```
+2. **启动前端开发服务（端口 `5173`）**：
+   ```powershell
+   cd UniLab-OS/frontend
+   npm install
+   npm run dev -- --host 127.0.0.1 --port 5173
+   ```
+   - 浏览器访问：`http://127.0.0.1:5173`
+   - Swagger 接口文档：`http://127.0.0.1:8000/docs`
+
+### 3.2 局域网/内网正式上线运行（单端口一体化模式）
+前端已配置自适应相对路径请求，打包生成 `frontend/dist` 后由 FastAPI 自动挂载静态资源，仅需对外开放一个 `8000` 端口即可同时提供页面与 API 服务：
+
+1. **Windows 一键打包并启动内网服务**：
+   ```powershell
+   cd UniLab-OS
+   .\deploy_intranet.ps1
+   ```
+   *(或手动执行：`cd frontend && npm run build && cd .. && python -m uvicorn backend.main:app --host 0.0.0.0 --port 8000`)*
+
+2. **放行系统防火墙端口（首次上线执行一次）**：
+   - **Windows（管理员 PowerShell）**：
+     ```powershell
+     New-NetFirewallRule -DisplayName "UniLab-OS-8000" -Direction Inbound -Protocol TCP -LocalPort 8000 -Action Allow
+     ```
+   - **Linux (ufw / firewalld)**：
+     ```bash
+     sudo ufw allow 8000/tcp
+     ```
+
+3. **内网访问与硬件接入地址**：
+   - 局域网电脑浏览器：`http://<服务器内网固定IP>:8000`
+   - 物联网终端/ERP网关：`http://<服务器内网固定IP>:8000/api/v1/ext/...`
+
+4. **生产环境加固与守护建议**：
+   - **后台常驻自启**：Windows 推荐使用 NSSM 注册为系统服务；Linux 推荐使用 `systemd` 守护进程。
+   - **修改硬件网关密钥**：上线前设置环境变量 `LAB_HARDWARE_TOKEN` 替换默认密钥。
+   - **数据库切换与备份**：中小规模可直接定时备份 `unilab_os.db`；高并发场景可配置环境变量 `DATABASE_URL="postgresql://user:pass@127.0.0.1:5432/unilab"` 无缝切换至 PostgreSQL。
+
+### 3.3 停止与关闭服务操作
+- **前台窗口运行中**：直接在对应的终端窗口按 **`Ctrl + C`** 停止。
+- **后台静默运行中**：执行项目根目录下的一键停止脚本：
+  ```powershell
+  .\stop_service.ps1
+  ```
+  *(或执行 PowerShell 命令清理占用 `8000`/`5173` 端口的进程：`Get-NetTCPConnection -LocalPort 8000,5173 -ErrorAction SilentlyContinue | Where-Object { $_.OwningProcess -gt 4 } | Select-Object -ExpandProperty OwningProcess -Unique | ForEach-Object { Stop-Process -Id $_ -Force }`；注意在 Windows 11 + PowerShell 7 下 `0.0.0.0` 监听套接字的 `State` 列可能为空，请勿附加 `-State Listen` 过滤条件。)*
+
+

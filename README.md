@@ -58,6 +58,18 @@ npm run dev -- --host 127.0.0.1 --port 5173
 ```
 - 前端管理界面：`http://127.0.0.1:5173`
 
+### 3. 内网单端口一键上线与服务关停 (Windows PowerShell)
+```powershell
+# 一键编译前端并以 0.0.0.0:8000 启动内网一体化服务
+.\deploy_intranet.ps1
+
+# 首次内网部署放行防火墙 8000 端口（管理员 PowerShell）
+New-NetFirewallRule -DisplayName "UniLab-OS-8000" -Direction Inbound -Protocol TCP -LocalPort 8000 -Action Allow
+
+# 一键停止后台运行的 8000 / 5173 服务进程
+.\stop_service.ps1
+```
+
 ---
 
 ## 内置演示账号
@@ -79,7 +91,9 @@ npm run dev -- --host 127.0.0.1 --port 5173
 ```text
 UniLab-OS/
 ├── README.md                         # 项目总览与快速启动说明
-├── HANDOFF.md                        # 项目交接文档與架构清单
+├── HANDOFF.md                        # 项目交接文档与架构清单
+├── deploy_intranet.ps1               # 内网单端口一键编译与上线启动脚本
+├── stop_service.ps1                  # 一键停止后台 8000 / 5173 服务进程脚本
 ├── docs/
 │   ├── SYSTEM_MANUAL.md              # 系统功能手册与多层级增删改查权限矩阵
 │   └── HARDWARE_INTEGRATION_SPEC.md  # 物联网硬件与外部 ERP 接口规范说明
