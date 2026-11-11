@@ -10,13 +10,17 @@ UniLab-OS 综合实验室线上管理平台主入口 (FastAPI Main Application)
 """
 
 import json
+import os
 import uuid
+from pathlib import Path
 from datetime import datetime, timedelta
 from decimal import Decimal
 from typing import Optional, List, Dict, Any
 
 from fastapi import FastAPI, Depends, HTTPException, Query, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from sqlalchemy import func
 from sqlalchemy.orm import Session
@@ -2372,3 +2376,24 @@ def init_db_and_seed():
 
 
 init_db_and_seed()
+
+
+@app.get("/health")
+def health_check():
+    """健康检查接口（用于内网监控与反向代理探活）"""
+    return {"status": "ok", "service": "UniLab-OS"}
+
+
+# ==================== 内网单端口一体化静态资源托管 ====================
+# 当执行过 `cd frontend && npm run build` 生成 dist 目录后，
+# 直接通过 `uvicorn backend.main:app --host 0.0.0.0 --port 8000` 即可单端口同时托管前后端
+FRONTEND_DIST_DIR = Path(__file__).resolve().parent.parent / "frontend" / "dist"
+if FRONTEND_DIST_DIR.exists() and (FRONTEND_DIST_DIR / "index.html").exists():
+    assets_dir = FRONTEND_DIST_DIR / "assets"
+    if assets_dir.exists():
+        app.mount("/assets", StaticFiles(directory=str(assets_dir)), name="frontend-assets")
+
+    @app.get("/", include_in_schema=False)
+    def serve_frontend_index():
+        return FileResponse(str(FRONTEND_DIST_DIR / "index.html"))
+

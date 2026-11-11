@@ -54,7 +54,7 @@ import {
   canDeleteELN,
 } from './permissions';
 
-const API_BASE = import.meta.env.VITE_API_BASE || 'http://127.0.0.1:8000';
+const API_BASE = import.meta.env.VITE_API_BASE ?? '';
 const DEFAULT_HW_TOKEN = 'UNILAB_HW_SECRET_2026';
 
 // 角色列表与细粒度权限勾选配置（对标 /lims/!roles 与 /lims/!roles/perms）
