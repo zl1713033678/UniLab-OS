@@ -2,24 +2,303 @@
 @tailwind components;
 @tailwind utilities;
 
-body {
-  background-color: #f4f7fc;
-  color: #1e293b;
-  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "PingFang SC", "Microsoft YaHei", sans-serif;
+:root {
+  color-scheme: light;
+  --surface-canvas: #f1f5f9;
+  --surface-card: #ffffff;
+  --surface-muted: #f8fafc;
+  --border-subtle: #cbd5e1;
+  --accent-primary: #1d4ed8;
+  --focus-ring: #1d4ed8;
+  --scrollbar-thumb: #94a3b8;
+  --scrollbar-track: #f1f5f9;
 }
 
-/* 清新浅色云控台滚动条美化 */
-::-webkit-scrollbar {
-  width: 6px;
-  height: 6px;
+html,
+body {
+  background-color: var(--surface-canvas);
+  color: #0f172a;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "PingFang SC", "Microsoft YaHei", sans-serif;
+  line-height: 1.5;
+  text-align: start;
 }
-::-webkit-scrollbar-track {
-  background: #f1f5f9;
+
+/* ==================== 无障碍隐藏工具类 & 跳过导航 ==================== */
+.visually-hidden:where(:not(:focus-within, :active)) {
+  position: absolute !important;
+  clip-path: inset(50%) !important;
+  overflow: hidden !important;
+  width: 1px !important;
+  height: 1px !important;
+  margin: -1px !important;
+  padding: 0 !important;
+  border: 0 !important;
+  white-space: nowrap !important;
 }
-::-webkit-scrollbar-thumb {
-  background: #cbd5e1;
-  border-radius: 9999px;
+
+.skip-link {
+  position: fixed;
+  inset-block-start: 0.75rem;
+  inset-inline-start: 0.75rem;
+  z-index: 9999;
+  padding: 0.5rem 0.875rem;
+  border-radius: 0.5rem;
+  background: #0f172a;
+  color: #ffffff;
+  font-weight: 600;
+  font-size: 0.8125rem;
+  box-shadow: 0 10px 25px rgb(15 23 42 / 0.25);
 }
-::-webkit-scrollbar-thumb:hover {
-  background: #94a3b8;
+
+/* ==================== 统一高对比度键盘焦点指示器 ==================== */
+:where(a[href], button, input, select, textarea, summary, [tabindex]):focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 2px;
+}
+
+/* ==================== 标准滚动条美化 + WebKit 隔离回退 ==================== */
+.custom-scrollbar,
+html {
+  scrollbar-color: var(--scrollbar-thumb) var(--scrollbar-track);
+  scrollbar-width: thin;
+}
+
+@supports not (scrollbar-color: auto) {
+  .custom-scrollbar,
+  html {
+    scrollbar-width: auto;
+  }
+
+  .custom-scrollbar::-webkit-scrollbar,
+  html::-webkit-scrollbar {
+    width: 8px;
+    height: 8px;
+  }
+
+  .custom-scrollbar::-webkit-scrollbar-track,
+  html::-webkit-scrollbar-track {
+    background: var(--scrollbar-track);
+  }
+
+  .custom-scrollbar::-webkit-scrollbar-thumb,
+  html::-webkit-scrollbar-thumb {
+    background: var(--scrollbar-thumb);
+    border-radius: 9999px;
+  }
+}
+
+/* ==================== 交互后表单校验 (:user-invalid / :user-valid) ==================== */
+:is(input, select, textarea):is(:user-invalid, .user-invalid-fallback) {
+  border-color: #dc2626 !important;
+  background-color: #fef2f2 !important;
+}
+
+:is(input, select, textarea):user-valid {
+  border-color: #059669;
+}
+
+/* ==================== 原生模态框 <dialog> ==================== */
+dialog.app-dialog:modal {
+  overscroll-behavior: contain;
+  margin: auto;
+  max-inline-size: min(32rem, calc(100dvw - 2rem));
+  max-block-size: calc(100dvh - 2rem);
+  padding: 0;
+  border: 1px solid #cbd5e1;
+  border-radius: 0.875rem;
+  background: #ffffff;
+  color: #0f172a;
+  box-shadow: 0 24px 48px rgb(15 23 42 / 0.22);
+}
+
+dialog.app-dialog::backdrop {
+  overflow: hidden;
+  overscroll-behavior: contain;
+  background: rgb(15 23 42 / 0.5);
+  backdrop-filter: blur(3px);
+}
+
+/* ==================== 响应式导航抽屉 (原生 <dialog> + Scroll-Snap) ==================== */
+dialog.nav-drawer {
+  --drawer-width: min(20rem, 84dvw, 100dvw - 24px);
+  --drawer-backdrop: 0;
+  inset: 0;
+  width: auto;
+  height: auto;
+  max-width: none;
+  max-height: none;
+  margin: 0;
+  padding: 0;
+  background: transparent;
+  border: 0;
+  overflow: visible;
+}
+
+dialog.nav-drawer::backdrop {
+  background: #0f172a;
+  opacity: calc(var(--drawer-backdrop) * 0.55);
+}
+
+.nav-drawer-scroller {
+  position: relative;
+  display: grid;
+  grid-template-columns: var(--drawer-width) 100%;
+  overflow-x: scroll;
+  overscroll-behavior: none;
+  scrollbar-width: none;
+  scroll-snap-type: x mandatory;
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  .nav-drawer-scroller {
+    scroll-behavior: smooth;
+  }
+}
+
+.nav-drawer-scroller::after {
+  content: '';
+  scroll-snap-align: end;
+  scroll-initial-target: nearest;
+}
+
+.nav-drawer-sheet {
+  display: flex;
+  flex-direction: column;
+  height: 100svh;
+  background: #f8fafc;
+  color: #0f172a;
+  overflow-y: auto;
+  scroll-snap-align: start;
+  border-inline-end: 1px solid #cbd5e1;
+  box-shadow: 12px 0 32px rgb(15 23 42 / 0.16);
+}
+
+@supports (animation-timeline: scroll()) {
+  dialog.nav-drawer {
+    timeline-scope: --drawer-fade;
+    animation: fade-drawer-backdrop linear both;
+    animation-timeline: --drawer-fade;
+  }
+
+  .nav-drawer-scroller {
+    scroll-timeline: --drawer-fade x;
+  }
+
+  @property --drawer-backdrop {
+    syntax: '<number>';
+    inherits: true;
+    initial-value: 0;
+  }
+
+  @keyframes fade-drawer-backdrop {
+    0% {
+      --drawer-backdrop: 1;
+    }
+    100% {
+      --drawer-backdrop: 0;
+    }
+  }
+}
+
+/* ==================== 响应式表格容器与吸顶表头 ==================== */
+.table-region {
+  overflow: auto;
+  max-inline-size: 100%;
+  container-type: inline-size;
+  border: 1px solid #e2e8f0;
+  border-radius: 0.75rem;
+  background: #ffffff;
+  box-shadow: 0 1px 2px rgb(15 23 42 / 0.04);
+}
+
+.table-region table {
+  width: 100%;
+  border-collapse: separate;
+  border-spacing: 0;
+}
+
+.table-region thead th {
+  position: sticky;
+  inset-block-start: 0;
+  z-index: 1;
+  background: #f8fafc;
+  text-wrap: balance;
+}
+
+/* 长列表延迟渲染优化 */
+.cv-row {
+  content-visibility: auto;
+  contain-intrinsic-size: auto 52px;
+}
+
+/* 单行溢出保持全量文本在 DOM 中 */
+.single-line-cell {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* ==================== 顶层悬浮通知容器 ==================== */
+.toast-layer[popover] {
+  position: fixed;
+  inset: auto 1rem 1.25rem auto;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  overflow: visible;
+  max-inline-size: min(26rem, calc(100dvw - 2rem));
+}
+
+/* ==================== Tab 指示器（不依赖颜色alone） ==================== */
+.modern-tab[aria-selected="true"] {
+  position: relative;
+  color: #1d4ed8;
+}
+
+.modern-tab[aria-selected="true"]::after {
+  content: "";
+  position: absolute;
+  inset-inline: 0.25rem;
+  inset-block-end: 0;
+  border-block-end: 2.5px solid #1d4ed8;
+  border-radius: 2px 2px 0 0;
+}
+
+/* ==================== 强制对比度模式兜底 ==================== */
+@media (forced-colors: active) {
+  .modern-tab[aria-selected="true"]::after {
+    border-block-end-color: Highlight;
+  }
+
+  dialog.app-dialog:modal {
+    border: 2px solid CanvasText;
+  }
+}
+
+/* ==================== 打印样式表（仅输出干净业务数据） ==================== */
+@media print {
+  body {
+    background: #ffffff !important;
+    color: #000000 !important;
+  }
+
+  .no-print,
+  header,
+  aside,
+  footer,
+  .toast-layer {
+    display: none !important;
+  }
+
+  main {
+    overflow: visible !important;
+    padding: 0 !important;
+  }
+
+  .table-region {
+    overflow: visible !important;
+    border: 1px solid #94a3b8 !important;
+    box-shadow: none !important;
+  }
 }
