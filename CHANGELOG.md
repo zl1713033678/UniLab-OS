@@ -4,6 +4,26 @@
 
 ---
 
+## [2.0.0] - 2026-11-18
+
+### Added
+- **1F/2F/3F SVG 数字孪生平面图与房间空间拓扑（融合 `Lab_Device_System` 设计）**：
+  - 新增 [`LabRoom`](./backend/models.py) 与 `Device` 空间遥测字段（`room_id`、`voltage`、`last_seen_at`、`is_online`、`telemetry_source`），通过 `ensure_schema_columns()` 平滑兼容旧数据库升级。
+  - 前端 `EquipmentsView` 的「实验室平面图监控」升级为 [`FloorplanTwin.jsx`](./frontend/src/components/FloorplanTwin.jsx)，提供 1F/2F/3F 分层架构图、缩放复位、真电流热力透视、🔓 房间拖拽持久化、底部负荷 Dock、非模态右侧设备抽屉与未知硬件自动发现 `<dialog>` 向导。
+- **可配置的 5 级权限可视界面层级（超级管理员系统设置）**：
+  - 在 `RolesView`（「系统设置与多级权限中心」）新增「权限可视界面设置」与「硬件接入系统设置」，允许 `ADMIN` 为 `DEPT_HEAD`/`PI`/`STAFF`/`OBSERVER` 独立勾选可见菜单、平面图操作能力（科室范围、遥测、热力、房间拖拽、状态切换、硬件纳管）与财务/组织/导出区域。
+  - 前端 [`App.jsx`](./frontend/src/App.jsx) 依据 `SystemSetting` 持久化策略动态裁剪侧边栏主模块、快捷入口、项目余额卡片、顶部「系统设置」及各子模块操作控件。
+- **ESP32 硬件网关融合、后台巡检与多表报表**：
+  - 新增兼容接口 `POST /api/v1/telemetry/ingest`（支持 `raw_data.current` 回填、施密特迟滞、`FAULT` 人工锁保护与未知设备自动发现），`lifespan` 异步心跳离线巡检（3s 间隔，分离 `is_online` 与预约业务态）及可选 `zeroconf` (`smartlab.local`) mDNS 服务广播。
+  - 新增 `GET /api/v1/reports/usage`、防公式注入 CSV 导出（`/api/v1/reports/export-csv`）及 3-Sheet 样式化 Excel 导出（`/api/v1/reports/export-excel`）；在 [`EntranceView.jsx`](./frontend/src/modules/EntranceView.jsx) 增加 ESP32 节点心跳与审计流水面板，并迁入脱敏固件模板 [`hardware/esp32/main/main.ino`](./hardware/esp32/main/main.ino) 与 [`hardware/simulate_esp32.py`](./hardware/simulate_esp32.py)。
+  - 新增 [`backend/test_fusion.py`](./backend/test_fusion.py) 覆盖 5 项回归验证并全部通过。
+
+### Fixed
+- **`BUG-003`（权限矩阵持久化与真实效用缺失）**：将「系统设置与权限」中的角色可视策略及操作权限矩阵持久化至 `SystemSetting` 表，接入 `/ws/lab-status` 实时广播并在前后两端强制执行可见与写操作约束。
+- **规避原 `Lab_Device_System` 遗留缺陷**：彻底隔离 `1F`/`2F`/`3F` 房间数据并使锁定态直接读取真实持久坐标（`BUG-006`）；基于设备实测电流计算负荷热力（`BUG-007`）；实现 CSV/Excel 单元格公式注入转义（`BUG-008`）；移除固件中的硬编码内网 IP 与明文 Wi-Fi 凭证（`BUG-001`）。
+
+---
+
 ## [Unreleased] - 2026-11-18
 
 ### Changed

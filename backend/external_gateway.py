@@ -11,9 +11,10 @@ UniLab-OS 外部硬件与第三方系统标准接入网关 (External Gateway)
 
 import json
 import os
+import uuid
 from datetime import datetime
 from decimal import Decimal
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
 
 from fastapi import APIRouter, Depends, Header, HTTPException
 from pydantic import BaseModel, Field
@@ -21,6 +22,8 @@ from sqlalchemy.orm import Session
 
 from .models import (
     get_db,
+    Department,
+    LabRoom,
     Device,
     User,
     Project,
@@ -30,10 +33,19 @@ from .models import (
     IoTTelemetryLog,
 )
 from .billing_engine import quantize_dec, deposit_project_grant
+from .lab_services import (
+    compute_schmitt_target_status,
+    get_hardware_gateway_settings,
+    record_device_usage_log,
+    serialize_devices,
+    serialize_rooms,
+    ws_manager,
+)
 
 HARDWARE_API_TOKEN = os.getenv("LAB_HARDWARE_TOKEN", "UNILAB_HW_SECRET_2026")
 
 external_router = APIRouter(prefix="/api/v1/ext", tags=["External Hardware & ERP Gateway"])
+telemetry_ingest_router = APIRouter(prefix="/api/v1", tags=["ESP32 Telemetry Compatibility"])
 
 
 def verify_hardware_token(
@@ -42,6 +54,22 @@ def verify_hardware_token(
     """校验外部硬件及第三方网关 API Key"""
     if x_lab_hardware_token != HARDWARE_API_TOKEN:
         raise HTTPException(status_code=401, detail="硬件网关鉴权失败：无效的 X-Lab-Hardware-Token")
+    return x_lab_hardware_token
+
+
+def verify_ingest_token(
+    x_lab_hardware_token: Optional[str] = Header(None, alias="X-Lab-Hardware-Token"),
+    db: Session = Depends(get_db),
+) -> str:
+    """支持通过后台开关控制是否要求 ESP32 兼容接入网关携带 X-Lab-Hardware-Token"""
+    gw_settings = get_hardware_gateway_settings(db)
+    if gw_settings.get("allow_open_esp32_ingest"):
+        return x_lab_hardware_token or "OPEN_INGEST"
+    if not x_lab_hardware_token or x_lab_hardware_token != HARDWARE_API_TOKEN:
+        raise HTTPException(
+            status_code=401,
+            detail="硬件网关鉴权失败：请在请求头携带有效 X-Lab-Hardware-Token（或由管理员在系统设置中临时开启免检调试）",
+        )
     return x_lab_hardware_token
 
 
@@ -79,10 +107,38 @@ class ERPGrantDepositPayload(BaseModel):
     operator_username: str = Field(..., description="经办财务或PI账号")
 
 
+class TelemetryChannelPayload(BaseModel):
+    device_code: str
+    status: Optional[str] = None
+    state: Optional[str] = None
+    current: Optional[Decimal] = None
+    rms_current_amps: Optional[Decimal] = None
+    voltage: Optional[Decimal] = Decimal("220.0000")
+    source_type: str = "ESP32_ACS712"
+    operator_rfid: Optional[str] = None
+    seq_id: Optional[str] = None
+    raw_data: Optional[Dict[str, Any]] = None
+
+
+class TelemetryIngestRequest(BaseModel):
+    """兼容单通道扁平 JSON 与多通道 channels 数组的 ESP32 遥测接入契约"""
+    channels: Optional[List[TelemetryChannelPayload]] = None
+    device_code: Optional[str] = None
+    status: Optional[str] = None
+    state: Optional[str] = None
+    current: Optional[Decimal] = None
+    rms_current_amps: Optional[Decimal] = None
+    voltage: Optional[Decimal] = Decimal("220.0000")
+    source_type: str = "ESP32_ACS712"
+    operator_rfid: Optional[str] = None
+    seq_id: Optional[str] = None
+    raw_data: Optional[Dict[str, Any]] = None
+
+
 # ==================== 路由实现 ====================
 
 @external_router.post("/iot/telemetry")
-def receive_iot_telemetry(
+async def receive_iot_telemetry(
     payload: IoTTelemetryPayload,
     db: Session = Depends(get_db),
     _token: str = Depends(verify_hardware_token),
@@ -116,9 +172,14 @@ def receive_iot_telemetry(
             "relay_command": "KEEP_ON" if device.status in ("RUNNING", "OVERTIME_RUNNING") else "ALLOW_START",
         }
 
+    previous_status = device.status
     amps = quantize_dec(payload.rms_current_amps)
     threshold = quantize_dec(device.standby_current_threshold)
+    now = datetime.utcnow()
     device.current_amps = amps
+    device.last_seen_at = now
+    device.is_online = True
+    device.telemetry_source = "IOT_GATEWAY"
 
     # 查找该设备当前生效或待签到的预约任务单
     active_res = (
@@ -132,7 +193,6 @@ def receive_iot_telemetry(
     )
 
     relay_command = "KEEP_ON"
-    now = datetime.utcnow()
 
     if payload.power_state == "FAULT":
         device.status = "FAULT"
@@ -177,7 +237,25 @@ def receive_iot_telemetry(
         project_code_override=payload.project_code_override,
     )
     db.add(telemetry_log)
+    if previous_status != device.status:
+        record_device_usage_log(
+            db,
+            device=device,
+            previous_status=previous_status,
+            new_status=device.status,
+            amps=amps,
+            voltage=quantize_dec(getattr(device, "voltage", Decimal("220.0000"))),
+            source_type="IOT_GATEWAY",
+            operator_name=payload.operator_rfid or "IOT_GATEWAY",
+            raw_data=json.dumps({"seq_id": payload.seq_id, "power_state": payload.power_state}, ensure_ascii=False),
+        )
     db.commit()
+
+    await ws_manager.broadcast_state(
+        "TELEMETRY_UPDATE",
+        serialize_devices(db),
+        serialize_rooms(db),
+    )
 
     return {
         "ack": True,
@@ -190,7 +268,7 @@ def receive_iot_telemetry(
 
 
 @external_router.post("/access/rfid-verify")
-def verify_rfid_access(
+async def verify_rfid_access(
     payload: RFIDVerifyPayload,
     db: Session = Depends(get_db),
     _token: str = Depends(verify_hardware_token),
@@ -256,10 +334,28 @@ def verify_rfid_access(
         }
 
     # 状态机联动：刷卡通过后自动将预约置为 ACTIVE，设备置为 RUNNING
+    prev_status = device.status
     reservation.status = "ACTIVE"
     reservation.checkin_method = "RFID_IOT"
     device.status = "RUNNING"
+    device.last_seen_at = datetime.utcnow()
+    device.is_online = True
+    device.telemetry_source = "RFID_IOT"
+    if prev_status != "RUNNING":
+        record_device_usage_log(
+            db,
+            device=device,
+            previous_status=prev_status,
+            new_status="RUNNING",
+            amps=quantize_dec(device.current_amps),
+            voltage=quantize_dec(getattr(device, "voltage", Decimal("220.0000"))),
+            source_type="RFID_IOT",
+            operator_name=user.full_name,
+            raw_data=json.dumps({"rfid": payload.rfid_card_id, "seq_id": payload.seq_id}, ensure_ascii=False),
+        )
     db.commit()
+
+    await ws_manager.broadcast_state("STATE_CHANGE", serialize_devices(db), serialize_rooms(db))
 
     return {
         "authorized": True,
@@ -337,4 +433,234 @@ def sync_erp_grant_deposit(
         "project_code": project.code,
         "available_balance": str(quantize_dec(project.available_balance)),
         "ledger_idempotency_key": ledger.idempotency_key,
+    }
+
+
+def _get_or_create_unassigned_room(db: Session, fallback_dept_id: int) -> LabRoom:
+    room = (
+        db.query(LabRoom)
+        .filter((LabRoom.code == "UNASSIGNED") | (LabRoom.name == "未分配实验室"))
+        .first()
+    )
+    if room:
+        return room
+    room = LabRoom(
+        code="UNASSIGNED",
+        name="未分配实验室",
+        floor="1F",
+        owner_dept_id=fallback_dept_id,
+        pos_x=80,
+        pos_y=600,
+        width=280,
+        height=130,
+        power_capacity_amps=Decimal("32.0000"),
+    )
+    db.add(room)
+    db.flush()
+    return room
+
+
+@telemetry_ingest_router.post("/telemetry/ingest")
+async def ingest_esp32_telemetry(
+    payload: TelemetryIngestRequest,
+    db: Session = Depends(get_db),
+    _token: str = Depends(verify_ingest_token),
+):
+    """
+    ESP32 / ACS712 兼容型高速遥测接入接口：
+    - 支持单通道扁平载荷与多通道 channels 数组
+    - 修复 raw_data.current 优先回填后执行施密特迟滞判定 (BUG-004)
+    - 遇到未知 device_code 自动发现入库至「未分配实验室」并触发前端弹窗指引
+    """
+    items: List[TelemetryChannelPayload] = []
+    if payload.channels:
+        items.extend(payload.channels)
+    elif payload.device_code:
+        items.append(
+            TelemetryChannelPayload(
+                device_code=payload.device_code,
+                status=payload.status,
+                state=payload.state,
+                current=payload.current,
+                rms_current_amps=payload.rms_current_amps,
+                voltage=payload.voltage,
+                source_type=payload.source_type,
+                operator_rfid=payload.operator_rfid,
+                seq_id=payload.seq_id,
+                raw_data=payload.raw_data,
+            )
+        )
+    else:
+        raise HTTPException(status_code=400, detail="请提供 device_code 或 channels 遥测列表")
+
+    gw_settings = get_hardware_gateway_settings(db)
+    schmitt_high = quantize_dec(Decimal(str(gw_settings.get("schmitt_high_amps", "0.5000"))))
+    schmitt_low = quantize_dec(Decimal(str(gw_settings.get("schmitt_low_amps", "0.0500"))))
+    first_dept = db.query(Department).order_by(Department.id.asc()).first()
+    if not first_dept:
+        raise HTTPException(status_code=500, detail="系统尚未初始化基础组织科室")
+
+    now = datetime.utcnow()
+    results: List[Dict[str, Any]] = []
+    discovered_devices: List[Dict[str, Any]] = []
+
+    for ch in items:
+        code = ch.device_code.strip()
+        raw_dict = ch.raw_data or {}
+
+        # BUG-004 修复：解析态优先回填 raw_data 中的 current / voltage
+        raw_curr = ch.current if ch.current is not None else ch.rms_current_amps
+        if raw_curr is None and "current" in raw_dict and raw_dict["current"] is not None:
+            raw_curr = Decimal(str(raw_dict["current"]))
+        amps = quantize_dec(raw_curr if raw_curr is not None else Decimal("0.0000"))
+
+        raw_volt = ch.voltage
+        if "voltage" in raw_dict and raw_dict["voltage"] is not None:
+            raw_volt = Decimal(str(raw_dict["voltage"]))
+        voltage = quantize_dec(raw_volt if raw_volt is not None else Decimal("220.0000"))
+
+        reported_status = ch.status or ch.state
+        device = db.query(Device).filter(Device.code == code).first()
+        is_new_discovery = False
+
+        if not device:
+            is_new_discovery = True
+            unassigned_room = _get_or_create_unassigned_room(db, first_dept.id)
+            target_init = compute_schmitt_target_status(
+                device=Device(status="IDLE", standby_current_threshold=Decimal("0.5000")),
+                amps=amps,
+                reported_status=reported_status,
+                source_type=ch.source_type,
+                schmitt_high=schmitt_high,
+                schmitt_low=schmitt_low,
+            )
+            device = Device(
+                code=code,
+                name=f"未命名传感器节点 ({code})",
+                owner_dept_id=first_dept.id,
+                room_id=unassigned_room.id,
+                pos_x=20,
+                pos_y=75,
+                status=target_init,
+                standby_current_threshold=schmitt_high,
+                current_amps=amps,
+                voltage=voltage,
+                last_seen_at=now,
+                is_online=True,
+                telemetry_source=ch.source_type,
+                internal_hourly_rate=Decimal("50.0000"),
+                external_hourly_rate=Decimal("100.0000"),
+                penalty_factor=Decimal("0.5000"),
+            )
+            db.add(device)
+            db.flush()
+            record_device_usage_log(
+                db,
+                device=device,
+                previous_status="NEW",
+                new_status=device.status,
+                amps=amps,
+                voltage=voltage,
+                source_type="AUTO_DISCOVERY",
+                operator_name=ch.source_type,
+                raw_data=json.dumps(raw_dict or {"device_code": code}, ensure_ascii=False),
+            )
+        else:
+            prev_status = device.status
+            target_status = compute_schmitt_target_status(
+                device=device,
+                amps=amps,
+                reported_status=reported_status,
+                source_type=ch.source_type,
+                schmitt_high=schmitt_high,
+                schmitt_low=schmitt_low,
+            )
+            # 若存在待签到预约且进入高负载，则同步联动激活预约
+            if target_status == "RUNNING":
+                active_res = (
+                    db.query(Reservation)
+                    .filter(
+                        Reservation.device_id == device.id,
+                        Reservation.status == "RESERVED",
+                    )
+                    .order_by(Reservation.start_time.asc())
+                    .first()
+                )
+                if active_res:
+                    active_res.status = "ACTIVE"
+                    active_res.checkin_method = ch.source_type
+
+            device.current_amps = amps
+            device.voltage = voltage
+            device.last_seen_at = now
+            device.is_online = True
+            device.telemetry_source = ch.source_type
+            device.status = target_status
+
+            if prev_status != target_status:
+                record_device_usage_log(
+                    db,
+                    device=device,
+                    previous_status=prev_status,
+                    new_status=target_status,
+                    amps=amps,
+                    voltage=voltage,
+                    source_type=ch.source_type,
+                    operator_name=ch.operator_rfid or ch.source_type,
+                    raw_data=json.dumps(raw_dict or {"current": str(amps)}, ensure_ascii=False),
+                )
+
+        seq = ch.seq_id or f"INGEST_{code}_{uuid.uuid4().hex[:10]}"
+        if not db.query(IoTTelemetryLog).filter(IoTTelemetryLog.seq_id == seq).first():
+            db.add(
+                IoTTelemetryLog(
+                    seq_id=seq,
+                    device_id=device.id,
+                    hardware_timestamp=int(now.timestamp()),
+                    rms_current_amps=amps,
+                    power_state=device.status,
+                    operator_rfid=ch.operator_rfid,
+                    project_code_override=None,
+                )
+            )
+
+        results.append(
+            {
+                "device_code": device.code,
+                "status": device.status,
+                "current_amps": str(amps),
+                "voltage": str(voltage),
+                "newly_discovered": is_new_discovery,
+            }
+        )
+        if is_new_discovery:
+            discovered_devices.append(
+                {
+                    "id": device.id,
+                    "code": device.code,
+                    "name": device.name,
+                    "current_amps": str(amps),
+                    "voltage": str(voltage),
+                    "source_type": ch.source_type,
+                }
+            )
+
+    db.commit()
+
+    all_devices = serialize_devices(db)
+    all_rooms = serialize_rooms(db)
+    if discovered_devices:
+        await ws_manager.broadcast_state(
+            "DEVICE_DISCOVERED",
+            all_devices,
+            all_rooms,
+            extra={"discovered_device": discovered_devices[0]},
+        )
+    else:
+        await ws_manager.broadcast_state("TELEMETRY_UPDATE", all_devices, all_rooms)
+
+    return {
+        "ack": True,
+        "processed_count": len(results),
+        "results": results,
     }

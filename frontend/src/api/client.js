@@ -41,6 +41,17 @@ export async function apiPut(path, bodyObj) {
   return json;
 }
 
+export async function apiPatch(path, bodyObj) {
+  const res = await fetch(`${API_BASE}${path}`, {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(bodyObj),
+  });
+  const json = await parseJsonSafe(res);
+  if (!res.ok) throw new Error(json.detail || JSON.stringify(json));
+  return json;
+}
+
 export async function apiDelete(path) {
   const res = await fetch(`${API_BASE}${path}`, { method: 'DELETE' });
   const json = await parseJsonSafe(res);
@@ -48,14 +59,18 @@ export async function apiDelete(path) {
   return json;
 }
 
+function sanitizeCsvCell(val) {
+  const s = String(val ?? '');
+  const guarded = s && ['=', '+', '-', '@', '\t', '\r'].includes(s[0]) ? `'${s}` : s;
+  return `"${guarded.replace(/"/g, '""')}"`;
+}
+
 export function exportTableToCSV(filename, headers, rows) {
   const csvContent =
     '\uFEFF' +
     [
-      headers.join(','),
-      ...rows.map((r) =>
-        r.map((c) => `"${String(c ?? '').replace(/"/g, '""')}"`).join(',')
-      ),
+      headers.map((h) => sanitizeCsvCell(h)).join(','),
+      ...rows.map((r) => r.map((c) => sanitizeCsvCell(c)).join(',')),
     ].join('\n');
   const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
   const url = URL.createObjectURL(blob);
@@ -102,8 +117,8 @@ export function useLabWebSocket(enabled, onDevicesEvent, onStatusChange) {
         ws.onmessage = (ev) => {
           try {
             const msg = JSON.parse(ev.data);
-            if (Array.isArray(msg?.devices)) {
-              onEventRef.current?.(msg.devices, msg.event);
+            if (Array.isArray(msg?.devices) || msg?.event) {
+              onEventRef.current?.(msg.devices || [], msg.event, msg);
             }
           } catch {
             // 忽略非 JSON 心跳

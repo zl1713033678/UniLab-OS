@@ -1,10 +1,11 @@
-import React, { useState } from 'react';
-import { Plus, Search, Download, Printer } from 'lucide-react';
+import React, { useEffect, useState } from 'react';
+import { Plus, Search, Download, Printer, FileSpreadsheet } from 'lucide-react';
 import TabBar from '../components/ui/TabBar';
 import DataTableShell from '../components/ui/DataTableShell';
 import StatusBadge from '../components/ui/StatusBadge';
+import FloorplanTwin from '../components/FloorplanTwin';
 import { FormField, INPUT_CLS } from '../components/ui/FormField';
-import { exportTableToCSV } from '../api/client';
+import { API_BASE, apiGet, exportTableToCSV } from '../api/client';
 import {
   canCreateDevice,
   canEditDevice,
@@ -15,6 +16,9 @@ import {
 export default function EquipmentsView({
   data,
   currentOperator,
+  rolePolicy,
+  discoveredDevice,
+  onDismissDiscoveredDevice,
   eqPrimaryTab,
   setEqPrimaryTab,
   eqSecondaryTab,
@@ -37,6 +41,12 @@ export default function EquipmentsView({
   onOpenDeviceDetail,
   onSaveDevice,
   onRequestDeleteDevice,
+  onSwitchDeviceStatus,
+  onSaveRoom,
+  onDeleteRoom,
+  onSaveRoomPosition,
+  onAssignDiscoveredDevice,
+  onRequestConfirm,
   onCreateReservation,
   onCheckin,
   onCheckout,
@@ -44,6 +54,19 @@ export default function EquipmentsView({
   onGoAddSampleForDevice,
 }) {
   const [showEqSearch, setShowEqSearch] = useState(false);
+  const [usageSessions, setUsageSessions] = useState([]);
+
+  useEffect(() => {
+    if (eqPrimaryTab === 'records') {
+      apiGet('/api/v1/reports/usage')
+        .then((rows) => setUsageSessions(Array.isArray(rows) ? rows : []))
+        .catch(() => {});
+    }
+  }, [eqPrimaryTab, data.devices]);
+
+  const floorplanPolicy = rolePolicy?.floorplan || {};
+  const canReserve = currentOperator?.system_role !== 'OBSERVER';
+  const canExport = rolePolicy?.data?.export_reports !== false;
 
   const filteredDevices = data.devices.filter((d) => {
     if (eqSecondaryTab !== 'all' && d.status !== eqSecondaryTab) return false;
@@ -148,6 +171,23 @@ export default function EquipmentsView({
                   {data.departments.map((d) => (
                     <option key={d.id} value={d.id}>
                       {d.name}
+                    </option>
+                  ))}
+                </select>
+              )}
+            </FormField>
+            <FormField label="所在物理实验房间">
+              {(props) => (
+                <select
+                  {...props}
+                  value={deviceForm.room_id || ''}
+                  onChange={(e) => setDeviceForm({ ...deviceForm, room_id: e.target.value })}
+                  className={INPUT_CLS}
+                >
+                  <option value="">暂未归房（未分配）</option>
+                  {(data.rooms || []).map((r) => (
+                    <option key={r.id} value={r.id}>
+                      [{r.floor}] {r.name}
                     </option>
                   ))}
                 </select>
@@ -308,13 +348,15 @@ export default function EquipmentsView({
                   <Plus className="w-3.5 h-3.5" aria-hidden="true" /> 添加仪器
                 </button>
               )}
-              <button
-                type="button"
-                onClick={() => setEqPrimaryTab('reserv')}
-                className="px-3 py-1.5 rounded-lg bg-blue-600 hover:bg-blue-700 text-white text-xs font-medium inline-flex items-center gap-1 shadow-sm"
-              >
-                <Plus className="w-3.5 h-3.5" aria-hidden="true" /> 预约登记
-              </button>
+              {canReserve && (
+                <button
+                  type="button"
+                  onClick={() => setEqPrimaryTab('reserv')}
+                  className="px-3 py-1.5 rounded-lg bg-blue-600 hover:bg-blue-700 text-white text-xs font-medium inline-flex items-center gap-1 shadow-sm"
+                >
+                  <Plus className="w-3.5 h-3.5" aria-hidden="true" /> 预约登记
+                </button>
+              )}
               <button
                 type="button"
                 aria-expanded={showEqSearch}
@@ -323,27 +365,30 @@ export default function EquipmentsView({
               >
                 <Search className="w-3.5 h-3.5" aria-hidden="true" /> 高级筛选
               </button>
-              <button
-                type="button"
-                onClick={() =>
-                  exportTableToCSV(
-                    'equipments.csv',
-                    ['编号', '名称', '归口科室', '状态', '实时电流(A)', '科内时薪', '跨科时薪'],
-                    filteredDevices.map((d) => [
-                      d.code,
-                      d.name,
-                      d.owner_dept_name,
-                      d.status,
-                      d.current_amps,
-                      d.internal_hourly_rate,
-                      d.external_hourly_rate,
-                    ])
-                  )
-                }
-                className="px-3 py-1.5 rounded-lg border border-slate-300 bg-white hover:bg-slate-50 text-slate-700 text-xs inline-flex items-center gap-1"
-              >
-                <Download className="w-3.5 h-3.5" aria-hidden="true" /> 导出 CSV
-              </button>
+              {canExport && (
+                <button
+                  type="button"
+                  onClick={() =>
+                    exportTableToCSV(
+                      'equipments.csv',
+                      ['编号', '名称', '归口科室', '所在房间', '状态', '实时电流(A)', '科内时薪', '跨科时薪'],
+                      filteredDevices.map((d) => [
+                        d.code,
+                        d.name,
+                        d.owner_dept_name,
+                        d.room_name || '未分配实验室',
+                        d.status,
+                        d.current_amps,
+                        d.internal_hourly_rate,
+                        d.external_hourly_rate,
+                      ])
+                    )
+                  }
+                  className="px-3 py-1.5 rounded-lg border border-slate-300 bg-white hover:bg-slate-50 text-slate-700 text-xs inline-flex items-center gap-1"
+                >
+                  <Download className="w-3.5 h-3.5" aria-hidden="true" /> 导出 CSV
+                </button>
+              )}
               <button
                 type="button"
                 onClick={() => window.print()}
@@ -447,23 +492,31 @@ export default function EquipmentsView({
                       >
                         {dev.name}
                       </button>
-                      <div className="text-[11px] text-slate-500 font-mono">{dev.code}</div>
-                      <div className="mt-1 flex gap-1.5 no-print">
-                        <button
-                          type="button"
-                          onClick={() => onOpenDeviceDetail(dev.id, 'reserv')}
-                          className="px-2 py-0.5 rounded bg-emerald-600 hover:bg-emerald-700 text-white text-[10px] font-medium"
-                        >
-                          预约
-                        </button>
-                        <button
-                          type="button"
-                          onClick={() => onGoAddSampleForDevice(dev)}
-                          className="px-2 py-0.5 rounded bg-amber-500 hover:bg-amber-600 text-white text-[10px] font-medium"
-                        >
-                          送样
-                        </button>
+                      <div className="text-[11px] text-slate-500 font-mono">
+                        {dev.code} · {dev.room_floor || '1F'} {dev.room_name || '未分配房间'}
                       </div>
+                      {(canReserve || rolePolicy?.modules?.samples !== false) && (
+                        <div className="mt-1 flex gap-1.5 no-print">
+                          {canReserve && (
+                            <button
+                              type="button"
+                              onClick={() => onOpenDeviceDetail(dev.id, 'reserv')}
+                              className="px-2 py-0.5 rounded bg-emerald-600 hover:bg-emerald-700 text-white text-[10px] font-medium"
+                            >
+                              预约
+                            </button>
+                          )}
+                          {canReserve && rolePolicy?.modules?.samples !== false && (
+                            <button
+                              type="button"
+                              onClick={() => onGoAddSampleForDevice(dev)}
+                              className="px-2 py-0.5 rounded bg-amber-500 hover:bg-amber-600 text-white text-[10px] font-medium"
+                            >
+                              送样
+                            </button>
+                          )}
+                        </div>
+                      )}
                     </td>
                     <td className="py-2.5 px-3 text-center">
                       <StatusBadge status={dev.status} suffix={`${dev.current_amps}A`} />
@@ -500,6 +553,7 @@ export default function EquipmentsView({
                               code: dev.code,
                               name: dev.name,
                               owner_dept_id: dev.owner_dept_id,
+                              room_id: dev.room_id ? String(dev.room_id) : '',
                               pos_x: dev.pos_x,
                               pos_y: dev.pos_y,
                               status: dev.status,
@@ -742,7 +796,34 @@ export default function EquipmentsView({
 
       {(eqPrimaryTab === 'records' || eqPrimaryTab === 'reserv') && (
         <div className="space-y-4">
-          {eqPrimaryTab === 'reserv' && (
+          {eqPrimaryTab === 'records' && canExport && (
+            <div className="p-3.5 rounded-xl border border-slate-200 bg-slate-50 flex flex-wrap items-center justify-between gap-2 no-print">
+              <div className="text-xs text-slate-700">
+                <strong className="text-slate-900">硬件上下机履历与三表样式化导出</strong>
+                <span className="text-slate-500 ml-2">
+                  涵盖设备总览、硬件通断电会话时长（{usageSessions.length} 条）与遥测审计流水
+                </span>
+              </div>
+              <div className="flex flex-wrap items-center gap-2">
+                <a
+                  href={`${API_BASE}/api/v1/reports/export-csv`}
+                  download
+                  className="inline-flex items-center gap-1 px-3 py-1.5 rounded-lg border border-slate-300 bg-white hover:bg-slate-100 text-slate-700 text-xs font-medium"
+                >
+                  <Download className="w-3.5 h-3.5" aria-hidden="true" /> 导出履历 CSV
+                </a>
+                <a
+                  href={`${API_BASE}/api/v1/reports/export-excel`}
+                  download
+                  className="inline-flex items-center gap-1 px-3 py-1.5 rounded-lg bg-emerald-700 hover:bg-emerald-800 text-white text-xs font-semibold shadow-sm"
+                >
+                  <FileSpreadsheet className="w-3.5 h-3.5" aria-hidden="true" /> 导出 3-Sheet Excel
+                </a>
+              </div>
+            </div>
+          )}
+
+          {eqPrimaryTab === 'reserv' && canReserve && (
             <form
               onSubmit={onCreateReservation}
               className="p-4 bg-slate-50 border border-slate-200 rounded-xl flex flex-wrap items-end gap-3 no-print"
@@ -887,44 +968,61 @@ export default function EquipmentsView({
               ))}
             </tbody>
           </DataTableShell>
+
+          {eqPrimaryTab === 'records' && usageSessions.length > 0 && (
+            <DataTableShell caption="物联网硬件通断电及手动状态有效使用履历">
+              <thead className="border-b border-slate-200 text-slate-700">
+                <tr>
+                  <th scope="col" className="py-2 px-3 text-left">设备编号</th>
+                  <th scope="col" className="py-2 px-3 text-left">设备名称</th>
+                  <th scope="col" className="py-2 px-3 text-left">所在房间</th>
+                  <th scope="col" className="py-2 px-3 text-left">开机时间(UTC)</th>
+                  <th scope="col" className="py-2 px-3 text-left">结束时间(UTC)</th>
+                  <th scope="col" className="py-2 px-3 text-left">有效时长</th>
+                  <th scope="col" className="py-2 px-3 text-left">操作人/节点</th>
+                  <th scope="col" className="py-2 px-3 text-left">触发来源</th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-slate-100">
+                {usageSessions.map((s, idx) => (
+                  <tr key={`${s.device_code}-${idx}`} className="cv-row hover:bg-blue-50/40">
+                    <td className="py-2 px-3 font-mono font-bold text-blue-700">{s.device_code}</td>
+                    <td className="py-2 px-3 font-medium text-slate-900">{s.name}</td>
+                    <td className="py-2 px-3 text-slate-600">{s.room_name}</td>
+                    <td className="py-2 px-3 font-mono text-[11px]">{s.start_time}</td>
+                    <td className="py-2 px-3 font-mono text-[11px]">{s.end_time}</td>
+                    <td className="py-2 px-3 font-mono font-semibold text-emerald-700">
+                      {s.formatted_duration}
+                    </td>
+                    <td className="py-2 px-3">{s.operator}</td>
+                    <td className="py-2 px-3">
+                      <span className="px-2 py-0.5 rounded bg-slate-100 border border-slate-200 font-mono text-[10px]">
+                        {s.source_type}
+                      </span>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </DataTableShell>
+          )}
         </div>
       )}
 
       {eqPrimaryTab === 'map' && (
-        <section aria-label="实验室 2D 设备平面图监控" className="space-y-2">
-          <div className="text-xs text-slate-600 flex items-center justify-between">
-            <span>点击平面图中的仪器卡片可查看详情、实时电流与预约</span>
-            <span className="font-mono text-[11px] text-slate-500">
-              在线设备 {data.devices.length} 台
-            </span>
-          </div>
-          <div className="relative h-[26rem] w-full rounded-xl border border-slate-300 bg-[#f8fafc] bg-[radial-gradient(#cbd5e1_1px,transparent_1px)] [background-size:20px_20px] overflow-hidden shadow-inner">
-            {data.devices.map((dev) => (
-              <button
-                key={dev.id}
-                type="button"
-                style={{ left: `${dev.pos_x}%`, top: `${dev.pos_y}%` }}
-                onClick={() => onOpenDeviceDetail(dev.id)}
-                className="text-left absolute -translate-x-1/2 -translate-y-1/2 w-56 p-3 rounded-xl bg-white border border-slate-300 shadow-md hover:border-blue-600 hover:shadow-lg transition"
-              >
-                <div className="flex items-center justify-between gap-1">
-                  <span className="font-mono font-bold text-blue-700 text-xs">{dev.code}</span>
-                  <StatusBadge status={dev.status} showCode={false} />
-                </div>
-                <div className="font-semibold text-slate-900 single-line-cell mt-1 text-xs">
-                  {dev.name}
-                </div>
-                <div className="text-[11px] text-slate-500 single-line-cell">
-                  {dev.owner_dept_name}
-                </div>
-                <div className="mt-1.5 pt-1.5 border-t border-slate-100 flex justify-between font-mono text-[11px] tabular-nums">
-                  <span className="text-blue-700 font-semibold">电流: {dev.current_amps}A</span>
-                  <span className="text-slate-600">¥{dev.internal_hourly_rate}/h</span>
-                </div>
-              </button>
-            ))}
-          </div>
-        </section>
+        <FloorplanTwin
+          data={data}
+          currentOperator={currentOperator}
+          floorplanPolicy={floorplanPolicy}
+          discoveredDevice={discoveredDevice}
+          onDismissDiscoveredDevice={onDismissDiscoveredDevice}
+          onOpenDeviceDetail={onOpenDeviceDetail}
+          onSwitchDeviceStatus={onSwitchDeviceStatus}
+          onSaveRoom={onSaveRoom}
+          onDeleteRoom={onDeleteRoom}
+          onSaveRoomPosition={onSaveRoomPosition}
+          onAssignDiscoveredDevice={onAssignDiscoveredDevice}
+          onRequestConfirm={onRequestConfirm}
+        />
       )}
     </div>
   );

@@ -115,14 +115,37 @@ class ProjectMember(Base):
     user = relationship("User", back_populates="project_memberships")
 
 
+class LabRoom(Base):
+    """物理实验房间与楼层空间拓扑表（支持 1F/2F/3F 数字孪生平面图布局与电力配额）"""
+    __tablename__ = "lab_rooms"
+
+    id = Column(Integer, primary_key=True, index=True)
+    code = Column(String(32), unique=True, nullable=False, index=True, comment="房间编码")
+    name = Column(String(128), unique=True, nullable=False, index=True, comment="房间名称")
+    floor = Column(String(16), nullable=False, default="1F", comment="所属楼层: 1F/2F/3F")
+    owner_dept_id = Column(Integer, ForeignKey("departments.id"), nullable=True, comment="归口行政科室ID")
+    pos_x = Column(Integer, nullable=False, default=80, comment="SVG平面图左上角X坐标(0-1200)")
+    pos_y = Column(Integer, nullable=False, default=80, comment="SVG平面图左上角Y坐标(0-800)")
+    width = Column(Integer, nullable=False, default=320, comment="SVG平面图房间宽度")
+    height = Column(Integer, nullable=False, default=190, comment="SVG平面图房间高度")
+    power_capacity_amps = Column(
+        Numeric(12, 4), nullable=False, default=Decimal("32.0000"), comment="房间额定总电流上限(A)"
+    )
+    created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
+
+    owner_department = relationship("Department")
+    devices = relationship("Device", back_populates="room")
+
+
 class Device(Base):
-    """FMS 设备台账与双费率模型"""
+    """FMS 设备台账与双费率模型（含空间房间归属与实时遥测心跳状态）"""
     __tablename__ = "devices"
 
     id = Column(Integer, primary_key=True, index=True)
     code = Column(String(64), unique=True, nullable=False, index=True, comment="设备资产编号")
     name = Column(String(128), nullable=False, comment="设备名称")
     owner_dept_id = Column(Integer, ForeignKey("departments.id"), nullable=False, comment="归口管理行政科室ID")
+    room_id = Column(Integer, ForeignKey("lab_rooms.id"), nullable=True, index=True, comment="所在物理实验房间ID")
     pos_x = Column(Integer, nullable=False, default=100, comment="实验室平面图X坐标")
     pos_y = Column(Integer, nullable=False, default=100, comment="实验室平面图Y坐标")
     status = Column(
@@ -135,6 +158,10 @@ class Device(Base):
         Numeric(12, 4), nullable=False, default=Decimal("1.5000"), comment="待机电流判定阈值(A)"
     )
     current_amps = Column(Numeric(12, 4), nullable=False, default=Decimal("0.1000"), comment="当前实时电流(A)")
+    voltage = Column(Numeric(12, 4), nullable=False, default=Decimal("220.0000"), comment="当前采样电压(V)")
+    last_seen_at = Column(DateTime, nullable=True, comment="硬件最近心跳UTC时间")
+    is_online = Column(Boolean, nullable=False, default=True, comment="物联网采集节点在线状态")
+    telemetry_source = Column(String(64), nullable=False, default="MANUAL_WEB", comment="最近状态/遥测来源")
     internal_hourly_rate = Column(
         Numeric(12, 4), nullable=False, default=Decimal("50.0000"), comment="本科室人员自用优惠时薪"
     )
@@ -146,6 +173,7 @@ class Device(Base):
     )
 
     owner_department = relationship("Department", back_populates="devices")
+    room = relationship("LabRoom", back_populates="devices")
 
 
 class Reservation(Base):
@@ -293,3 +321,37 @@ class IoTTelemetryLog(Base):
     operator_rfid = Column(String(64), nullable=True, comment="刷卡操作员RFID")
     project_code_override = Column(String(64), nullable=True, comment="硬件端指定项目编码")
     created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
+
+
+class DeviceUsageLog(Base):
+    """设备状态跃迁与硬件审计日志表（只追加，用于使用履历与异常溯源）"""
+    __tablename__ = "device_usage_logs"
+
+    id = Column(Integer, primary_key=True, index=True)
+    device_id = Column(Integer, ForeignKey("devices.id"), nullable=False, index=True, comment="设备ID")
+    device_code = Column(String(64), nullable=False, index=True, comment="设备编号")
+    previous_status = Column(String(32), nullable=False, comment="跃迁前状态")
+    new_status = Column(String(32), nullable=False, comment="跃迁后状态")
+    current_amps = Column(Numeric(12, 4), nullable=False, default=Decimal("0.0000"), comment="采样电流(A)")
+    voltage = Column(Numeric(12, 4), nullable=False, default=Decimal("220.0000"), comment="采样电压(V)")
+    source_type = Column(
+        String(64),
+        nullable=False,
+        default="MANUAL_WEB",
+        comment="来源: MANUAL_WEB/ESP32_ACS712/IOT_GATEWAY/HARDWARE_OFFLINE/AUTO_DISCOVERY",
+    )
+    operator_name = Column(String(64), nullable=False, default="SYSTEM", comment="操作者或硬件节点标识")
+    raw_data = Column(Text, nullable=True, comment="原始JSON载荷或断电离线备注")
+    created_at = Column(DateTime, nullable=False, default=datetime.utcnow, index=True)
+
+    device = relationship("Device")
+
+
+class SystemSetting(Base):
+    """系统级配置与多角色界面可视策略持久化表"""
+    __tablename__ = "system_settings"
+
+    key = Column(String(64), primary_key=True, comment="配置键名")
+    value = Column(Text, nullable=False, default="{}", comment="JSON结构化配置值")
+    updated_by_user_id = Column(Integer, ForeignKey("users.id"), nullable=True, comment="最后更新管理员ID")
+    updated_at = Column(DateTime, nullable=False, default=datetime.utcnow, onupdate=datetime.utcnow)

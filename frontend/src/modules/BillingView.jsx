@@ -7,6 +7,7 @@ import { exportTableToCSV } from '../api/client';
 
 export default function BillingView({
   data,
+  rolePolicy,
   billingPrimaryTab,
   setBillingPrimaryTab,
   simErp,
@@ -14,6 +15,7 @@ export default function BillingView({
   onTriggerSimErpDeposit,
   onOpenLabDetail,
 }) {
+  const showGlobalFinance = rolePolicy?.data?.show_global_finance !== false;
   const totalBudgetSum = data.projects.reduce((acc, p) => acc + Number(p.total_budget), 0);
   const totalAvailSum = data.projects.reduce((acc, p) => acc + Number(p.available_balance), 0);
   const totalFrozenSum = data.projects.reduce((acc, p) => acc + Number(p.frozen_balance), 0);
@@ -54,8 +56,12 @@ export default function BillingView({
         tabs={[
           { id: 'accounts', label: '财务账号总览', count: data.projects.length },
           { id: 'transactions', label: '收支明细流水', count: data.ledgers.length },
-          { id: 'departments', label: '财务部门产值', count: data.dept_revenue_summary.length },
-          { id: 'deposit', label: '经费充值 / ERP 调账' },
+          ...(showGlobalFinance
+            ? [
+                { id: 'departments', label: '财务部门产值', count: data.dept_revenue_summary.length },
+                { id: 'deposit', label: '经费充值 / ERP 调账' },
+              ]
+            : []),
         ]}
         activeId={billingPrimaryTab}
         onChange={setBillingPrimaryTab}
@@ -65,13 +71,15 @@ export default function BillingView({
         <div className="space-y-3">
           <div className="bg-slate-50 border border-slate-200 p-2.5 rounded-xl flex flex-wrap items-center justify-between gap-2 no-print">
             <div className="flex gap-2">
-              <button
-                type="button"
-                onClick={() => setBillingPrimaryTab('deposit')}
-                className="px-3 py-1.5 rounded-lg bg-blue-600 hover:bg-blue-700 text-white text-xs font-medium inline-flex items-center gap-1 shadow-sm"
-              >
-                <Plus className="w-3.5 h-3.5" aria-hidden="true" /> 经费拨款入账
-              </button>
+              {showGlobalFinance && (
+                <button
+                  type="button"
+                  onClick={() => setBillingPrimaryTab('deposit')}
+                  className="px-3 py-1.5 rounded-lg bg-blue-600 hover:bg-blue-700 text-white text-xs font-medium inline-flex items-center gap-1 shadow-sm"
+                >
+                  <Plus className="w-3.5 h-3.5" aria-hidden="true" /> 经费拨款入账
+                </button>
+              )}
               <button
                 type="button"
                 onClick={() =>

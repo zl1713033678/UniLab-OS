@@ -9,9 +9,11 @@ UniLab-OS 综合实验室线上管理平台主入口 (FastAPI Main Application)
 - Module D: 复式记账总账、科室产值统计与 WebSocket 实时状态推送
 """
 
+import asyncio
 import json
 import os
 import uuid
+from contextlib import asynccontextmanager
 from pathlib import Path
 from datetime import datetime, timedelta
 from decimal import Decimal
@@ -19,7 +21,7 @@ from typing import Optional, List, Dict, Any
 
 from fastapi import FastAPI, Depends, HTTPException, Query, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from sqlalchemy import func
@@ -31,10 +33,13 @@ from .models import (
     SessionLocal,
     get_db,
     Department,
+    LabRoom,
     User,
     Project,
     ProjectMember,
     Device,
+    DeviceUsageLog,
+    SystemSetting,
     Reservation,
     Consumable,
     Sample,
@@ -49,12 +54,119 @@ from .billing_engine import (
     settle_fms_reservation,
     settle_lims_immediate,
 )
-from .external_gateway import external_router
+from .external_gateway import external_router, telemetry_ingest_router
+from .lab_services import (
+    DEFAULT_ROLE_VISIBILITY_POLICIES,
+    build_usage_sessions,
+    export_usage_csv_bytes,
+    export_usage_excel_bytes,
+    get_hardware_gateway_settings,
+    get_lan_ipv4,
+    get_role_permissions_override,
+    get_visibility_policies,
+    mdns_advertiser,
+    record_device_usage_log,
+    save_hardware_gateway_settings,
+    save_role_permissions_override,
+    save_visibility_policies,
+    serialize_devices,
+    serialize_rooms,
+    ws_manager,
+)
+
+
+async def hardware_heartbeat_checker_loop():
+    """后台异步硬件心跳巡检：分离连接在线态(is_online)与业务预约态，避免误清未结束预约"""
+    while True:
+        await asyncio.sleep(3)
+        db = SessionLocal()
+        try:
+            gw_settings = get_hardware_gateway_settings(db)
+            timeout_sec = max(5, int(gw_settings.get("offline_timeout_seconds", 10)))
+            cutoff = datetime.utcnow() - timedelta(seconds=timeout_sec)
+
+            # 仅巡检带真实硬件心跳时间戳且当前标记为在线的节点
+            stale_devices = (
+                db.query(Device)
+                .filter(
+                    Device.is_online == True,  # noqa: E712
+                    Device.last_seen_at.isnot(None),
+                    Device.last_seen_at < cutoff,
+                    Device.telemetry_source != "MANUAL_WEB",
+                )
+                .all()
+            )
+            if not stale_devices:
+                continue
+
+            changed = False
+            for dev in stale_devices:
+                dev.is_online = False
+                prev = dev.status
+                active_res = (
+                    db.query(Reservation)
+                    .filter(Reservation.device_id == dev.id, Reservation.status == "ACTIVE")
+                    .first()
+                )
+                # 无进行中预约且非故障锁定时，设备安全归位 IDLE 并记入审计流水
+                if prev in ("RUNNING", "OVERTIME_RUNNING") and not active_res:
+                    dev.status = "IDLE"
+                    dev.current_amps = Decimal("0.0000")
+                    record_device_usage_log(
+                        db,
+                        device=dev,
+                        previous_status=prev,
+                        new_status="IDLE",
+                        amps=Decimal("0.0000"),
+                        voltage=quantize_dec(getattr(dev, "voltage", Decimal("220.0000"))),
+                        source_type="HARDWARE_OFFLINE",
+                        operator_name="WATCHDOG",
+                        raw_data=f"超过 {timeout_sec}s 未收到硬件心跳，自动标记离线并归位待机",
+                    )
+                changed = True
+
+            if changed:
+                db.commit()
+                await ws_manager.broadcast_state(
+                    "DEVICE_OFFLINE",
+                    serialize_devices(db),
+                    serialize_rooms(db),
+                )
+        except asyncio.CancelledError:
+            break
+        except Exception:
+            db.rollback()
+        finally:
+            db.close()
+
+
+@asynccontextmanager
+async def app_lifespan(_app: FastAPI):
+    db = SessionLocal()
+    try:
+        gw_settings = get_hardware_gateway_settings(db)
+        if gw_settings.get("mdns_enabled", True):
+            mdns_advertiser.start(host_prefix=str(gw_settings.get("mdns_host", "smartlab")), port=8000)
+    finally:
+        db.close()
+
+    watchdog_task = asyncio.create_task(hardware_heartbeat_checker_loop())
+    try:
+        yield
+    finally:
+        watchdog_task.cancel()
+        try:
+            await watchdog_task
+        except asyncio.CancelledError:
+            pass
+        mdns_advertiser.stop()
+
 
 app = FastAPI(
     title="UniLab-OS 综合实验室线上管理平台",
-    version="1.0.0",
-    description="支持矩阵式RBAC、FMS机时调度、LIMS样品耗材、ELN保密隔离及跨科复式记账引擎",
+    version="2.0.0",
+    description="支持矩阵式RBAC、FMS机时调度、1F/2F/3F数字孪生平面图、ESP32硬件遥测、LIMS/ELN及跨科复式记账引擎",
+    lifespan=app_lifespan,
 )
 
 app.add_middleware(
@@ -65,42 +177,9 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# 注册外部硬件与第三方系统网关路由
+# 注册外部硬件与第三方系统网关路由 + ESP32 兼容遥测网关
 app.include_router(external_router)
-
-
-# ==================== WebSocket 实时广播管理 ====================
-
-class LabConnectionManager:
-    """管理前端实验室平面图 WebSocket 实时连接"""
-    def __init__(self):
-        self.active_connections: List[WebSocket] = []
-
-    async def connect(self, websocket: WebSocket):
-        await websocket.accept()
-        self.active_connections.append(websocket)
-
-    def disconnect(self, websocket: WebSocket):
-        if websocket in self.active_connections:
-            self.active_connections.remove(websocket)
-
-    async def broadcast_state(self, event_name: str, devices_data: List[Dict[str, Any]]):
-        payload = {
-            "event": event_name,
-            "devices": devices_data,
-            "timestamp": datetime.utcnow().isoformat(),
-        }
-        stale = []
-        for conn in self.active_connections:
-            try:
-                await conn.send_json(payload)
-            except Exception:
-                stale.append(conn)
-        for conn in stale:
-            self.disconnect(conn)
-
-
-ws_manager = LabConnectionManager()
+app.include_router(telemetry_ingest_router)
 
 
 # ==================== Pydantic 请求模型 ====================
@@ -182,12 +261,64 @@ class FMSDeviceUpsertRequest(BaseModel):
     code: str
     name: str
     owner_dept_id: int
+    room_id: Optional[int] = None
     pos_x: int = 50
     pos_y: int = 50
     status: str = "IDLE"
     standby_current_threshold: Decimal = Decimal("1.5000")
+    voltage: Decimal = Decimal("220.0000")
     internal_hourly_rate: Decimal = Decimal("80.0000")
     external_hourly_rate: Decimal = Decimal("200.0000")
+
+
+class DeviceStatusSwitchRequest(BaseModel):
+    operator_user_id: int
+    new_status: str
+
+
+class RoomCreateRequest(BaseModel):
+    operator_user_id: int
+    code: str
+    name: str
+    floor: str = "1F"
+    owner_dept_id: Optional[int] = None
+    pos_x: int = 80
+    pos_y: int = 80
+    width: int = 320
+    height: int = 190
+    power_capacity_amps: Decimal = Decimal("32.0000")
+
+
+class RoomUpdateRequest(BaseModel):
+    operator_user_id: int
+    code: Optional[str] = None
+    name: str
+    floor: str = "1F"
+    owner_dept_id: Optional[int] = None
+    power_capacity_amps: Decimal = Decimal("32.0000")
+
+
+class RoomPositionUpdateRequest(BaseModel):
+    operator_user_id: int
+    pos_x: int
+    pos_y: int
+    floor: Optional[str] = None
+
+
+class VisibilityPoliciesUpdateRequest(BaseModel):
+    operator_user_id: int
+    policies: Dict[str, Any]
+    role_permissions: Optional[List[Dict[str, Any]]] = None
+
+
+class HardwareGatewaySettingsUpdateRequest(BaseModel):
+    operator_user_id: int
+    allow_open_esp32_ingest: bool = False
+    offline_timeout_seconds: int = 10
+    schmitt_high_amps: Decimal = Decimal("0.5000")
+    schmitt_low_amps: Decimal = Decimal("0.0500")
+    mdns_enabled: bool = True
+    mdns_host: str = "smartlab"
 
 
 class LIMSConsumableUpsertRequest(BaseModel):
@@ -323,31 +454,6 @@ def compute_eln_synthesized_cost(db: Session, eln: ELNRecord) -> Decimal:
         if smp:
             total += quantize_dec(smp.total_test_fee)
     return quantize_dec(total)
-
-
-def serialize_devices(db: Session) -> List[Dict[str, Any]]:
-    """序列化全部设备台账状态"""
-    devices = db.query(Device).order_by(Device.id.asc()).all()
-    result = []
-    for d in devices:
-        result.append(
-            {
-                "id": d.id,
-                "code": d.code,
-                "name": d.name,
-                "owner_dept_id": d.owner_dept_id,
-                "owner_dept_name": d.owner_department.name if d.owner_department else "",
-                "pos_x": d.pos_x,
-                "pos_y": d.pos_y,
-                "status": d.status,
-                "standby_current_threshold": str(quantize_dec(d.standby_current_threshold)),
-                "current_amps": str(quantize_dec(d.current_amps)),
-                "internal_hourly_rate": str(quantize_dec(d.internal_hourly_rate)),
-                "external_hourly_rate": str(quantize_dec(d.external_hourly_rate)),
-                "penalty_factor": str(quantize_dec(d.penalty_factor)),
-            }
-        )
-    return result
 
 
 # ==================== 核心业务路由 ====================
@@ -560,8 +666,10 @@ def get_bootstrap_data(
             }
         )
 
+    hw_settings = get_hardware_gateway_settings(db)
     return {
         "departments": departments,
+        "rooms": serialize_rooms(db),
         "users": users,
         "projects": projects,
         "project_members": project_members,
@@ -572,6 +680,15 @@ def get_bootstrap_data(
         "eln_records": eln_list,
         "ledgers": ledgers,
         "dept_revenue_summary": dept_revenue_summary,
+        "role_visibility_policies": get_visibility_policies(db),
+        "role_permissions_override": get_role_permissions_override(db),
+        "hardware_gateway_settings": hw_settings,
+        "system_info": {
+            "lan_ip": get_lan_ipv4(),
+            "port": 8000,
+            "mdns_active": mdns_advertiser.active,
+            "mdns_host": mdns_advertiser.host_fqdn or f"{hw_settings.get('mdns_host', 'smartlab')}.local",
+        },
     }
 
 
@@ -1548,7 +1665,7 @@ def lock_eln_record(
 
 
 @app.post("/api/v1/fms/devices")
-def create_fms_device(
+async def create_fms_device(
     req: FMSDeviceUpsertRequest,
     db: Session = Depends(get_db),
 ):
@@ -1567,11 +1684,15 @@ def create_fms_device(
         code=req.code.strip(),
         name=req.name.strip(),
         owner_dept_id=req.owner_dept_id,
+        room_id=req.room_id,
         pos_x=req.pos_x,
         pos_y=req.pos_y,
         status=req.status,
         standby_current_threshold=quantize_dec(req.standby_current_threshold),
         current_amps=Decimal("0.2000"),
+        voltage=quantize_dec(req.voltage),
+        is_online=True,
+        telemetry_source="MANUAL_WEB",
         internal_hourly_rate=quantize_dec(req.internal_hourly_rate),
         external_hourly_rate=quantize_dec(req.external_hourly_rate),
         penalty_factor=Decimal("0.5000"),
@@ -1579,11 +1700,12 @@ def create_fms_device(
     db.add(dev)
     db.commit()
     db.refresh(dev)
-    return {"id": dev.id, "code": dev.code, "name": dev.name}
+    await ws_manager.broadcast_state("STATE_CHANGE", serialize_devices(db), serialize_rooms(db))
+    return {"id": dev.id, "code": dev.code, "name": dev.name, "room_id": dev.room_id}
 
 
 @app.put("/api/v1/fms/devices/{device_id}")
-def update_fms_device(
+async def update_fms_device(
     device_id: int,
     req: FMSDeviceUpsertRequest,
     db: Session = Depends(get_db),
@@ -1605,23 +1727,84 @@ def update_fms_device(
             detail=f"权限不足：仪器【{dev.code}】归口【{dev.owner_department.name}】，仅超级管理员或归口科室负责人可修改",
         )
 
+    prev_status = dev.status
     dev.code = req.code.strip()
     dev.name = req.name.strip()
     if is_admin:
         dev.owner_dept_id = req.owner_dept_id
+    if req.room_id is not None:
+        dev.room_id = req.room_id
     dev.pos_x = req.pos_x
     dev.pos_y = req.pos_y
     dev.status = req.status
     dev.standby_current_threshold = quantize_dec(req.standby_current_threshold)
+    dev.voltage = quantize_dec(req.voltage)
     dev.internal_hourly_rate = quantize_dec(req.internal_hourly_rate)
     dev.external_hourly_rate = quantize_dec(req.external_hourly_rate)
+    if prev_status != dev.status:
+        record_device_usage_log(
+            db,
+            device=dev,
+            previous_status=prev_status,
+            new_status=dev.status,
+            amps=quantize_dec(dev.current_amps),
+            voltage=quantize_dec(dev.voltage),
+            source_type="MANUAL_WEB",
+            operator_name=operator.full_name,
+            raw_data="后台台账更新状态",
+        )
     db.commit()
     db.refresh(dev)
-    return {"id": dev.id, "code": dev.code, "name": dev.name, "status": dev.status}
+    await ws_manager.broadcast_state("STATE_CHANGE", serialize_devices(db), serialize_rooms(db))
+    return {"id": dev.id, "code": dev.code, "name": dev.name, "status": dev.status, "room_id": dev.room_id}
+
+
+@app.post("/api/v1/fms/devices/{device_id}/status")
+async def switch_device_status_manual(
+    device_id: int,
+    req: DeviceStatusSwitchRequest,
+    db: Session = Depends(get_db),
+):
+    """平面图抽屉手动切换仪器状态（包含解除 FAULT 故障锁定）：仅 ADMIN、归口 DEPT_HEAD 或归口 STAFF 可执行"""
+    operator = db.query(User).filter(User.id == req.operator_user_id).first()
+    dev = db.query(Device).filter(Device.id == device_id).first()
+    if not operator or not dev:
+        raise HTTPException(status_code=404, detail="操作员或仪器不存在")
+
+    is_admin = operator.system_role == "ADMIN"
+    is_owner_staff = operator.home_dept_id == dev.owner_dept_id and operator.system_role in ("DEPT_HEAD", "STAFF")
+    if not (is_admin or is_owner_staff):
+        raise HTTPException(status_code=403, detail="权限不足：仅超级管理员或归口科室仪器负责人可手动切态/解除故障锁")
+
+    allowed_statuses = {"IDLE", "RESERVED", "RUNNING", "OVERTIME_RUNNING", "FAULT"}
+    target = req.new_status.strip().upper()
+    if target == "IN_USE":
+        target = "RUNNING"
+    if target not in allowed_statuses:
+        raise HTTPException(status_code=400, detail=f"不支持的设备状态: {req.new_status}")
+
+    prev = dev.status
+    dev.status = target
+    dev.telemetry_source = "MANUAL_WEB"
+    if prev != target:
+        record_device_usage_log(
+            db,
+            device=dev,
+            previous_status=prev,
+            new_status=target,
+            amps=quantize_dec(dev.current_amps),
+            voltage=quantize_dec(getattr(dev, "voltage", Decimal("220.0000"))),
+            source_type="MANUAL_WEB",
+            operator_name=operator.full_name,
+            raw_data=f"平面图控制台人工切换: {prev} -> {target}",
+        )
+    db.commit()
+    await ws_manager.broadcast_state("STATE_CHANGE", serialize_devices(db), serialize_rooms(db))
+    return {"id": dev.id, "code": dev.code, "previous_status": prev, "status": dev.status}
 
 
 @app.delete("/api/v1/fms/devices/{device_id}")
-def delete_fms_device(
+async def delete_fms_device(
     device_id: int,
     operator_user_id: int = Query(...),
     db: Session = Depends(get_db),
@@ -1645,10 +1828,318 @@ def delete_fms_device(
     if active_count > 0:
         raise HTTPException(status_code=400, detail=f"仪器【{dev.code}】尚有 {active_count} 笔未完结预约，请先取消或结算后再删除")
 
+    from .models import IoTTelemetryLog
+    db.query(IoTTelemetryLog).filter(IoTTelemetryLog.device_id == dev.id).delete()
+    db.query(DeviceUsageLog).filter(DeviceUsageLog.device_id == dev.id).delete()
     db.query(Reservation).filter(Reservation.device_id == dev.id).delete()
     db.delete(dev)
     db.commit()
+    await ws_manager.broadcast_state("STATE_CHANGE", serialize_devices(db), serialize_rooms(db))
     return {"deleted_device_id": device_id, "code": dev.code}
+
+
+# ==================== 物理实验房间拓扑管理 (/api/v1/rooms) ====================
+
+@app.get("/api/v1/rooms")
+def list_lab_rooms(db: Session = Depends(get_db)):
+    return serialize_rooms(db)
+
+
+@app.post("/api/v1/rooms")
+async def create_lab_room(req: RoomCreateRequest, db: Session = Depends(get_db)):
+    operator = db.query(User).filter(User.id == req.operator_user_id).first()
+    if not operator:
+        raise HTTPException(status_code=404, detail="操作员不存在")
+    if operator.system_role != "ADMIN":
+        if operator.system_role != "DEPT_HEAD" or (req.owner_dept_id and req.owner_dept_id != operator.home_dept_id):
+            raise HTTPException(status_code=403, detail="权限不足：仅超级管理员或归口科室主任可创建实验房间")
+
+    code = req.code.strip().upper()
+    name = req.name.strip()
+    if db.query(LabRoom).filter((LabRoom.code == code) | (LabRoom.name == name)).first():
+        raise HTTPException(status_code=409, detail=f"房间编码【{code}】或名称【{name}】已存在")
+
+    floor = req.floor.strip().upper() if req.floor.strip().upper() in ("1F", "2F", "3F") else "1F"
+    room = LabRoom(
+        code=code,
+        name=name,
+        floor=floor,
+        owner_dept_id=req.owner_dept_id or operator.home_dept_id,
+        pos_x=max(40, min(860, req.pos_x)),
+        pos_y=max(40, min(560, req.pos_y)),
+        width=max(180, min(460, req.width)),
+        height=max(110, min(280, req.height)),
+        power_capacity_amps=quantize_dec(req.power_capacity_amps),
+    )
+    db.add(room)
+    db.commit()
+    db.refresh(room)
+    await ws_manager.broadcast_state("ROOM_UPDATED", serialize_devices(db), serialize_rooms(db))
+    return {"id": room.id, "code": room.code, "name": room.name, "floor": room.floor}
+
+
+@app.put("/api/v1/rooms/{room_id}")
+async def update_lab_room(room_id: int, req: RoomUpdateRequest, db: Session = Depends(get_db)):
+    operator = db.query(User).filter(User.id == req.operator_user_id).first()
+    room = db.query(LabRoom).filter(LabRoom.id == room_id).first()
+    if not operator or not room:
+        raise HTTPException(status_code=404, detail="操作员或实验房间不存在")
+    if operator.system_role != "ADMIN" and not (
+        operator.system_role == "DEPT_HEAD" and operator.home_dept_id == room.owner_dept_id
+    ):
+        raise HTTPException(status_code=403, detail="权限不足：仅超级管理员或归口科室主任可修改房间属性")
+
+    new_name = req.name.strip()
+    conflict = db.query(LabRoom).filter(LabRoom.name == new_name, LabRoom.id != room_id).first()
+    if conflict:
+        raise HTTPException(status_code=409, detail=f"房间名称【{new_name}】已被占用")
+
+    room.name = new_name
+    if req.code:
+        room.code = req.code.strip().upper()
+    if req.floor.strip().upper() in ("1F", "2F", "3F"):
+        room.floor = req.floor.strip().upper()
+    if operator.system_role == "ADMIN":
+        room.owner_dept_id = req.owner_dept_id
+    room.power_capacity_amps = quantize_dec(req.power_capacity_amps)
+    db.commit()
+    await ws_manager.broadcast_state("ROOM_UPDATED", serialize_devices(db), serialize_rooms(db))
+    return {"id": room.id, "code": room.code, "name": room.name, "floor": room.floor}
+
+
+@app.patch("/api/v1/rooms/{room_id}/position")
+async def update_lab_room_position(
+    room_id: int,
+    req: RoomPositionUpdateRequest,
+    db: Session = Depends(get_db),
+):
+    operator = db.query(User).filter(User.id == req.operator_user_id).first()
+    room = db.query(LabRoom).filter(LabRoom.id == room_id).first()
+    if not operator or not room:
+        raise HTTPException(status_code=404, detail="操作员或房间不存在")
+    if operator.system_role != "ADMIN" and not (
+        operator.system_role == "DEPT_HEAD" and operator.home_dept_id == room.owner_dept_id
+    ):
+        raise HTTPException(status_code=403, detail="权限不足：仅超级管理员或归口科室主任可调整房间平面图坐标")
+
+    room.pos_x = max(44, min(1150 - room.width, int(req.pos_x)))
+    room.pos_y = max(44, min(750 - room.height, int(req.pos_y)))
+    if req.floor and req.floor.strip().upper() in ("1F", "2F", "3F"):
+        room.floor = req.floor.strip().upper()
+    db.commit()
+    await ws_manager.broadcast_state("ROOM_UPDATED", serialize_devices(db), serialize_rooms(db))
+    return {"id": room.id, "pos_x": room.pos_x, "pos_y": room.pos_y, "floor": room.floor}
+
+
+@app.delete("/api/v1/rooms/{room_id}")
+async def delete_lab_room(
+    room_id: int,
+    operator_user_id: int = Query(...),
+    db: Session = Depends(get_db),
+):
+    operator = db.query(User).filter(User.id == operator_user_id).first()
+    room = db.query(LabRoom).filter(LabRoom.id == room_id).first()
+    if not operator or not room:
+        raise HTTPException(status_code=404, detail="操作员或房间不存在")
+    if room.code == "UNASSIGNED":
+        raise HTTPException(status_code=400, detail="系统保留的「未分配实验室」兜底区域不可删除")
+    if operator.system_role != "ADMIN" and not (
+        operator.system_role == "DEPT_HEAD" and operator.home_dept_id == room.owner_dept_id
+    ):
+        raise HTTPException(status_code=403, detail="权限不足：仅超级管理员或归口科室主任可删除房间")
+
+    db.query(Device).filter(Device.room_id == room.id).update({"room_id": None})
+    db.delete(room)
+    db.commit()
+    await ws_manager.broadcast_state("ROOM_UPDATED", serialize_devices(db), serialize_rooms(db))
+    return {"deleted_room_id": room_id}
+
+
+# ==================== 系统设置：多级角色可视界面层级与硬件参数配置 ====================
+
+@app.get("/api/v1/system/visibility-policies")
+def get_system_visibility_policies(db: Session = Depends(get_db)):
+    return {
+        "policies": get_visibility_policies(db),
+        "role_permissions_override": get_role_permissions_override(db),
+        "hardware_gateway_settings": get_hardware_gateway_settings(db),
+    }
+
+
+@app.put("/api/v1/system/visibility-policies")
+async def update_system_visibility_policies(
+    req: VisibilityPoliciesUpdateRequest,
+    db: Session = Depends(get_db),
+):
+    operator = db.query(User).filter(User.id == req.operator_user_id).first()
+    if not operator or operator.system_role != "ADMIN":
+        raise HTTPException(status_code=403, detail="权限不足：仅平台超级管理员(ADMIN)可配置各权限级别可视界面层级")
+
+    saved_policies = save_visibility_policies(db, req.policies, operator.id)
+    saved_perms = None
+    if req.role_permissions is not None:
+        saved_perms = save_role_permissions_override(db, req.role_permissions, operator.id)
+
+    await ws_manager.broadcast_state(
+        "POLICY_UPDATED",
+        serialize_devices(db),
+        serialize_rooms(db),
+        extra={
+            "role_visibility_policies": saved_policies,
+            "role_permissions_override": saved_perms,
+        },
+    )
+    return {
+        "policies": saved_policies,
+        "role_permissions_override": saved_perms,
+    }
+
+
+@app.post("/api/v1/system/visibility-policies/reset")
+async def reset_system_visibility_policies(
+    operator_user_id: int = Query(...),
+    db: Session = Depends(get_db),
+):
+    operator = db.query(User).filter(User.id == operator_user_id).first()
+    if not operator or operator.system_role != "ADMIN":
+        raise HTTPException(status_code=403, detail="权限不足：仅平台超级管理员(ADMIN)可重置默认可视策略")
+
+    saved_policies = save_visibility_policies(db, DEFAULT_ROLE_VISIBILITY_POLICIES, operator.id)
+    await ws_manager.broadcast_state(
+        "POLICY_UPDATED",
+        serialize_devices(db),
+        serialize_rooms(db),
+        extra={"role_visibility_policies": saved_policies},
+    )
+    return {"policies": saved_policies}
+
+
+@app.put("/api/v1/system/hardware-settings")
+async def update_system_hardware_settings(
+    req: HardwareGatewaySettingsUpdateRequest,
+    db: Session = Depends(get_db),
+):
+    operator = db.query(User).filter(User.id == req.operator_user_id).first()
+    if not operator or operator.system_role != "ADMIN":
+        raise HTTPException(status_code=403, detail="权限不足：仅平台超级管理员(ADMIN)可修改硬件网关参数")
+
+    saved = save_hardware_gateway_settings(
+        db,
+        {
+            "allow_open_esp32_ingest": req.allow_open_esp32_ingest,
+            "offline_timeout_seconds": max(5, min(300, req.offline_timeout_seconds)),
+            "schmitt_high_amps": str(quantize_dec(req.schmitt_high_amps)),
+            "schmitt_low_amps": str(quantize_dec(req.schmitt_low_amps)),
+            "mdns_enabled": req.mdns_enabled,
+            "mdns_host": req.mdns_host.strip() or "smartlab",
+        },
+        operator.id,
+    )
+    return {"hardware_gateway_settings": saved}
+
+
+# ==================== 硬件巡检、系统状态与报表导出 ====================
+
+@app.get("/api/v1/system/info")
+def get_system_lan_info(db: Session = Depends(get_db)):
+    hw_settings = get_hardware_gateway_settings(db)
+    lan_ip = get_lan_ipv4()
+    return {
+        "lan_ip": lan_ip,
+        "port": 8000,
+        "lan_url": f"http://{lan_ip}:8000",
+        "mdns_active": mdns_advertiser.active,
+        "mdns_host": mdns_advertiser.host_fqdn or f"{hw_settings.get('mdns_host', 'smartlab')}.local",
+        "ingest_endpoint": "/api/v1/telemetry/ingest",
+        "ext_iot_endpoint": "/api/v1/ext/iot/telemetry",
+        "ws_endpoint": "/ws/lab-status",
+        "allow_open_esp32_ingest": bool(hw_settings.get("allow_open_esp32_ingest", False)),
+        "offline_timeout_seconds": int(hw_settings.get("offline_timeout_seconds", 10)),
+    }
+
+
+@app.get("/api/v1/hardware/status")
+def get_hardware_nodes_status(db: Session = Depends(get_db)):
+    devices = db.query(Device).order_by(Device.id.asc()).all()
+    now = datetime.utcnow()
+    return [
+        {
+            "device_id": d.id,
+            "device_code": d.code,
+            "name": d.name,
+            "room_name": d.room.name if d.room else "未分配实验室",
+            "status": d.status,
+            "is_online": bool(getattr(d, "is_online", True)),
+            "current_amps": str(quantize_dec(d.current_amps)),
+            "voltage": str(quantize_dec(getattr(d, "voltage", Decimal("220.0000")))),
+            "telemetry_source": getattr(d, "telemetry_source", "MANUAL_WEB") or "MANUAL_WEB",
+            "last_seen_at": d.last_seen_at.isoformat() if getattr(d, "last_seen_at", None) else None,
+            "seconds_since_heartbeat": (
+                int((now - d.last_seen_at).total_seconds())
+                if getattr(d, "last_seen_at", None)
+                else None
+            ),
+        }
+        for d in devices
+    ]
+
+
+@app.get("/api/v1/hardware/logs")
+def get_hardware_usage_logs(
+    limit: int = Query(100, ge=1, le=500),
+    db: Session = Depends(get_db),
+):
+    logs = (
+        db.query(DeviceUsageLog)
+        .order_by(DeviceUsageLog.created_at.desc(), DeviceUsageLog.id.desc())
+        .limit(limit)
+        .all()
+    )
+    return [
+        {
+            "id": l.id,
+            "device_id": l.device_id,
+            "device_code": l.device_code,
+            "previous_status": l.previous_status,
+            "new_status": l.new_status,
+            "current_amps": str(quantize_dec(l.current_amps)),
+            "voltage": str(quantize_dec(l.voltage)),
+            "source_type": l.source_type,
+            "operator_name": l.operator_name,
+            "raw_data": l.raw_data,
+            "created_at": l.created_at.isoformat(),
+        }
+        for l in logs
+    ]
+
+
+@app.get("/api/v1/reports/usage")
+def get_usage_sessions_report(db: Session = Depends(get_db)):
+    return build_usage_sessions(db)
+
+
+@app.get("/api/v1/reports/export-csv")
+def export_usage_csv_report(db: Session = Depends(get_db)):
+    data = export_usage_csv_bytes(db)
+    filename = f"unilab_usage_report_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.csv"
+    return Response(
+        content=data,
+        media_type="text/csv; charset=utf-8",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+@app.get("/api/v1/reports/export-excel")
+def export_usage_excel_report(db: Session = Depends(get_db)):
+    data = export_usage_excel_bytes(db)
+    if data is None:
+        raise HTTPException(status_code=501, detail="服务端未安装 openpyxl，暂无法导出 Excel 工作簿")
+    filename = f"unilab_full_report_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.xlsx"
+    return Response(
+        content=data,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
 
 
 @app.delete("/api/v1/fms/reservations/{reservation_id}")
@@ -1954,7 +2445,7 @@ def delete_eln_record(
 
 @app.websocket("/ws/lab-status")
 async def lab_status_websocket(websocket: WebSocket):
-    """实时推送实验室平面图设备状态与电流遥测数据"""
+    """实时推送实验室平面图设备状态、房间拓扑、可配置权限策略与电流遥测数据"""
     await ws_manager.connect(websocket)
     try:
         db = SessionLocal()
@@ -1963,6 +2454,8 @@ async def lab_status_websocket(websocket: WebSocket):
                 {
                     "event": "INITIAL_SNAPSHOT",
                     "devices": serialize_devices(db),
+                    "rooms": serialize_rooms(db),
+                    "role_visibility_policies": get_visibility_policies(db),
                     "timestamp": datetime.utcnow().isoformat(),
                 }
             )
@@ -1977,6 +2470,7 @@ async def lab_status_websocket(websocket: WebSocket):
                     {
                         "event": "STATE_CHANGE",
                         "devices": serialize_devices(db),
+                        "rooms": serialize_rooms(db),
                         "timestamp": datetime.utcnow().isoformat(),
                     }
                 )
@@ -1989,7 +2483,7 @@ async def lab_status_websocket(websocket: WebSocket):
 # ==================== 数据库建表与开箱即用演示数据初始化 ====================
 
 def ensure_schema_columns():
-    """兼容已有 SQLite 数据库：若旧库缺少新增的多层级或鉴权字段则自动补齐"""
+    """兼容已有 SQLite 数据库：若旧库缺少新增的多层级、房间拓扑或硬件遥测字段则自动补齐"""
     from sqlalchemy import text
     with engine.begin() as conn:
         for stmt in [
@@ -2001,6 +2495,11 @@ def ensure_schema_columns():
             "ALTER TABLE users ADD COLUMN status VARCHAR(32) DEFAULT 'ACTIVE'",
             "ALTER TABLE users ADD COLUMN sub_group_name VARCHAR(64) DEFAULT '核心实验组'",
             "ALTER TABLE users ADD COLUMN created_at DATETIME",
+            "ALTER TABLE devices ADD COLUMN room_id INTEGER",
+            "ALTER TABLE devices ADD COLUMN voltage NUMERIC(12, 4) DEFAULT 220.0000",
+            "ALTER TABLE devices ADD COLUMN last_seen_at DATETIME",
+            "ALTER TABLE devices ADD COLUMN is_online BOOLEAN DEFAULT 1",
+            "ALTER TABLE devices ADD COLUMN telemetry_source VARCHAR(64) DEFAULT 'MANUAL_WEB'",
         ]:
             try:
                 conn.execute(text(stmt))
@@ -2008,13 +2507,150 @@ def ensure_schema_columns():
                 pass
 
 
+def ensure_default_rooms_and_bindings(db: Session):
+    """为新建或已有数据库自动补齐 1F/2F/3F 默认数字孪生房间、设备挂载及完整5级演示身份"""
+    depts = db.query(Department).order_by(Department.id.asc()).all()
+    if not depts:
+        return
+    dept_by_code = {d.code: d.id for d in depts}
+    mat_id = dept_by_code.get("DEPT-MAT", depts[0].id)
+    bio_id = dept_by_code.get("DEPT-BIO", depts[0].id)
+    ana_id = dept_by_code.get("DEPT-ANA", depts[0].id)
+
+    if db.query(LabRoom).count() == 0:
+        default_rooms = [
+            LabRoom(
+                code="RM-101",
+                name="101 精密微纳加工实验室",
+                floor="1F",
+                owner_dept_id=mat_id,
+                pos_x=72,
+                pos_y=68,
+                width=320,
+                height=210,
+                power_capacity_amps=Decimal("32.0000"),
+            ),
+            LabRoom(
+                code="RM-102",
+                name="102 精密质谱分析测试室",
+                floor="1F",
+                owner_dept_id=ana_id,
+                pos_x=435,
+                pos_y=68,
+                width=330,
+                height=210,
+                power_capacity_amps=Decimal("24.0000"),
+            ),
+            LabRoom(
+                code="RM-103",
+                name="103 综合化学前处理室",
+                floor="1F",
+                owner_dept_id=ana_id,
+                pos_x=808,
+                pos_y=68,
+                width=320,
+                height=210,
+                power_capacity_amps=Decimal("20.0000"),
+            ),
+            LabRoom(
+                code="RM-201",
+                name="201 合成生物与测序室",
+                floor="2F",
+                owner_dept_id=bio_id,
+                pos_x=72,
+                pos_y=68,
+                width=340,
+                height=210,
+                power_capacity_amps=Decimal("25.0000"),
+            ),
+            LabRoom(
+                code="RM-202",
+                name="202 超净光电表征室",
+                floor="2F",
+                owner_dept_id=mat_id,
+                pos_x=455,
+                pos_y=68,
+                width=330,
+                height=210,
+                power_capacity_amps=Decimal("20.0000"),
+            ),
+            LabRoom(
+                code="RM-301",
+                name="301 高通量生物智算中心",
+                floor="3F",
+                owner_dept_id=bio_id,
+                pos_x=220,
+                pos_y=464,
+                width=245,
+                height=160,
+                power_capacity_amps=Decimal("40.0000"),
+            ),
+            LabRoom(
+                code="RM-302",
+                name="302 大型仪器运维监控室",
+                floor="3F",
+                owner_dept_id=ana_id,
+                pos_x=735,
+                pos_y=464,
+                width=245,
+                height=160,
+                power_capacity_amps=Decimal("16.0000"),
+            ),
+        ]
+        db.add_all(default_rooms)
+        db.flush()
+
+    rooms_by_code = {r.code: r.id for r in db.query(LabRoom).all()}
+    dev_bindings = {
+        "CNC-01": rooms_by_code.get("RM-101"),
+        "SEM-02": rooms_by_code.get("RM-101"),
+        "LCMS-01": rooms_by_code.get("RM-102"),
+        "SEQ-01": rooms_by_code.get("RM-201"),
+    }
+    for d in db.query(Device).all():
+        if d.room_id is None and dev_bindings.get(d.code):
+            d.room_id = dev_bindings[d.code]
+
+    # 补全 PI 与 OBSERVER 演示账号，方便直接在页面体验全部 5 级权限界面层级
+    if not db.query(User).filter(User.username == "pi_zhou").first():
+        db.add(
+            User(
+                username="pi_zhou",
+                password_hash="123456",
+                full_name="周博士 (纳米课题组PI)",
+                email="pi_zhou@unilab.edu.cn",
+                rfid_card_id="CARD_889205",
+                system_role="PI",
+                status="ACTIVE",
+                sub_group_name="纳米药物制剂组",
+                home_dept_id=bio_id,
+            )
+        )
+    if not db.query(User).filter(User.username == "guest_obs").first():
+        db.add(
+            User(
+                username="guest_obs",
+                password_hash="123456",
+                full_name="赵同学 (只读观察员)",
+                email="guest_obs@unilab.edu.cn",
+                rfid_card_id="CARD_889206",
+                system_role="OBSERVER",
+                status="ACTIVE",
+                sub_group_name="公共见习组",
+                home_dept_id=ana_id,
+            )
+        )
+    db.commit()
+
+
 def init_db_and_seed():
-    """初始化 SQLite/PostgreSQL 表结构并写入矩阵式组织、跨科项目、设备、耗材及初始账本种子数据"""
+    """初始化 SQLite/PostgreSQL 表结构并写入矩阵式组织、房间拓扑、跨科项目、设备、耗材及初始账本种子数据"""
     Base.metadata.create_all(bind=engine)
     ensure_schema_columns()
     db = SessionLocal()
     try:
         if db.query(Department).count() > 0:
+            ensure_default_rooms_and_bindings(db)
             return
 
         # 1. 创建三大行政科室
@@ -2371,6 +3007,7 @@ def init_db_and_seed():
         )
         db.add(seed_eln)
         db.commit()
+        ensure_default_rooms_and_bindings(db)
     finally:
         db.close()
 

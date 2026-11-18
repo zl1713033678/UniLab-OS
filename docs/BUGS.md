@@ -11,7 +11,6 @@
 
 | 编号 | 级别 | 所属模块 | 缺陷描述与触发证据 | 代码坐标 | 状态 |
 | :--- | :---: | :--- | :--- | :--- | :---: |
-| **`BUG-001`** | **S0** | 认证与鉴权 | 登录接口存在 `req.password != "123456"` 万能兜底，且明文对比 `password_hash`；返回的 `token` 未在后续路由做 `Authorization: Bearer` 校验，所有业务接口直接信任请求参数中的 `operator_user_id`（生产上线前必须阻断） | `backend/main.py:588-604` | `OPEN` |
-| **`BUG-002`** | **S0** | 自助注册权限 | `auth_register` 允许注册请求直接传入 `system_role="ADMIN"` 并立即以 `ACTIVE` 状态写入，未做管理员审批或角色白名单降级限制 | `backend/main.py:643-656` | `OPEN` |
-| **`BUG-003`** | **S1** | 角色权限配置 | 前端「权限管理」页签中的细粒度复选框矩阵（`INITIAL_ROLES_CONFIG`）仅更新前端 React 状态，刷新页面即重置，未持久化到后端数据库也未参与后端接口鉴权 | `frontend/src/App.jsx:51-165` | `OPEN` |
-| **`BUG-004`** | **S2** | 质量与并发 | 仓库尚无自动化单元/集成测试，预约冲突检测与 `billing_engine.py` 扣费在 SQLite 默认隔离下未加显式行锁（PostgreSQL 切换时需配合 `SELECT ... FOR UPDATE`） | `backend/billing_engine.py:133-206` | `OPEN` |
+| **`BUG-001`** | **S0** | 认证与鉴权 | 登录接口存在 `req.password != "123456"` 万能兜底，且明文对比 `password_hash`；返回的 `token` 未在后续路由做 `Authorization: Bearer` 校验，业务接口仍接收 `operator_user_id`（生产上线前必须阻断） | `backend/main.py` (`auth_login`) | `OPEN` |
+| **`BUG-002`** | **S0** | 自助注册权限 | `auth_register` 允许注册请求直接传入 `system_role="ADMIN"` 并立即以 `ACTIVE` 状态写入，未做管理员审批或角色白名单降级限制 | `backend/main.py` (`auth_register`) | `OPEN` |
+| **`BUG-004`** | **S2** | 财务并发与测试 | 预约冲突检测与 `billing_engine.py` 扣费在 SQLite 默认隔离下未加显式行锁（PostgreSQL 切换需配合 `SELECT ... FOR UPDATE`），且 `billing_engine.py` 尚未建立 Hypothesis 资金守恒属性测试 | `backend/billing_engine.py:133-206` | `OPEN` |

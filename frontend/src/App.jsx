@@ -21,10 +21,16 @@ import {
   apiGet,
   apiPost,
   apiPut,
+  apiPatch,
   apiDelete,
   DEFAULT_HW_TOKEN,
   useLabWebSocket,
 } from './api/client';
+import {
+  DEFAULT_ROLE_VISIBILITY_POLICIES,
+  getFirstAccessibleModule,
+  resolveRoleVisibilityPolicy,
+} from './constants/visibilityPolicies';
 import ConfirmDialog from './components/ui/ConfirmDialog';
 import ToastRegion from './components/ui/ToastRegion';
 import ResponsiveDrawer from './components/ui/ResponsiveDrawer';
@@ -170,7 +176,7 @@ const NAV_MODULES = [
   { id: 'billing', label: '财务中心', icon: Landmark },
   { id: 'eln', label: '成果与记录', icon: FileText },
   { id: 'entrance', label: '门禁管理', icon: Radio },
-  { id: 'roles', label: '权限管理', icon: ShieldCheck },
+  { id: 'roles', label: '系统设置与权限', icon: ShieldCheck },
 ];
 
 function readInitialSession() {
@@ -193,6 +199,7 @@ export default function App() {
 
   const [data, setData] = useState({
     departments: [],
+    rooms: [],
     users: [],
     projects: [],
     project_members: [],
@@ -203,7 +210,20 @@ export default function App() {
     eln_records: [],
     ledgers: [],
     dept_revenue_summary: [],
+    system_info: null,
   });
+  const [visibilityPolicies, setVisibilityPolicies] = useState(
+    DEFAULT_ROLE_VISIBILITY_POLICIES
+  );
+  const [hwGatewaySettings, setHwGatewaySettings] = useState({
+    allow_open_esp32_ingest: false,
+    offline_timeout_seconds: 10,
+    schmitt_high_amps: '0.5000',
+    schmitt_low_amps: '0.0500',
+    mdns_enabled: true,
+    mdns_host: 'smartlab',
+  });
+  const [discoveredDevice, setDiscoveredDevice] = useState(null);
   const [loading, setLoading] = useState(false);
   const [wsStatus, setWsStatus] = useState('connecting');
   const [notice, setNotice] = useState({ type: '', text: '' });
@@ -263,9 +283,9 @@ export default function App() {
 
   const [billingPrimaryTab, setBillingPrimaryTab] = useState('accounts');
   const [elnPrimaryTab, setElnPrimaryTab] = useState('list');
-  const [entranceTab, setEntranceTab] = useState('rfid');
+  const [entranceTab, setEntranceTab] = useState('nodes');
 
-  const [rolesPrimaryTab, setRolesPrimaryTab] = useState('list');
+  const [rolesPrimaryTab, setRolesPrimaryTab] = useState('visibility');
   const [rolesConfig, setRolesConfig] = useState(INITIAL_ROLES_CONFIG);
   const [editingRoleId, setEditingRoleId] = useState('ADMIN');
 
@@ -323,6 +343,7 @@ export default function App() {
     code: 'XRD-03',
     name: '高分辨X射线衍射仪',
     owner_dept_id: 1,
+    room_id: '',
     pos_x: 65,
     pos_y: 35,
     status: 'IDLE',
@@ -432,6 +453,15 @@ export default function App() {
           `/api/v1/bootstrap?operator_user_id=${opId}&project_id=${prjId}`
         );
         setData(json);
+        if (json?.role_visibility_policies) {
+          setVisibilityPolicies(json.role_visibility_policies);
+        }
+        if (Array.isArray(json?.role_permissions_override)) {
+          setRolesConfig(json.role_permissions_override);
+        }
+        if (json?.hardware_gateway_settings) {
+          setHwGatewaySettings(json.hardware_gateway_settings);
+        }
       } catch (err) {
         setNotice({ type: 'error', text: err.message });
       } finally {
@@ -445,17 +475,27 @@ export default function App() {
     fetchBootstrap(operatorId, projectId);
   }, [fetchBootstrap, operatorId, projectId]);
 
-  // WebSocket 实时设备遥测与状态广播同步
+  // WebSocket 实时设备遥测、房间布局、自动发现与可视策略广播同步
   useLabWebSocket(
     isAuthenticated,
-    useCallback((devicesUpdate) => {
+    useCallback((devicesUpdate, eventName, fullMsg) => {
       setData((prev) => ({
         ...prev,
-        devices: prev.devices.map((d) => {
-          const hit = devicesUpdate.find((u) => u.id === d.id || u.code === d.code);
-          return hit ? { ...d, ...hit } : d;
-        }),
+        devices: Array.isArray(devicesUpdate) && devicesUpdate.length > 0 ? devicesUpdate : prev.devices,
+        rooms: Array.isArray(fullMsg?.rooms) ? fullMsg.rooms : prev.rooms,
       }));
+      if (fullMsg?.role_visibility_policies) {
+        setVisibilityPolicies(fullMsg.role_visibility_policies);
+      }
+      if (eventName === 'DEVICE_DISCOVERED' && fullMsg?.discovered_device) {
+        setDiscoveredDevice(fullMsg.discovered_device);
+      }
+      if (eventName === 'DEVICE_OFFLINE') {
+        setNotice({
+          type: 'info',
+          text: '监测到部分硬件节点心跳超时离线，系统已自动隔离状态并记录审计日志',
+        });
+      }
     }, []),
     setWsStatus
   );
@@ -464,6 +504,31 @@ export default function App() {
     () => data.users.find((u) => u.id === Number(operatorId)),
     [data.users, operatorId]
   );
+  const activeVisibilityPolicy = useMemo(
+    () => resolveRoleVisibilityPolicy(visibilityPolicies, currentOperator),
+    [visibilityPolicies, currentOperator]
+  );
+  const visibleNavModules = useMemo(
+    () =>
+      NAV_MODULES.filter((m) => {
+        if (m.id === 'roles') {
+          return currentOperator?.system_role === 'ADMIN';
+        }
+        return activeVisibilityPolicy?.modules?.[m.id] !== false;
+      }),
+    [activeVisibilityPolicy, currentOperator]
+  );
+
+  useEffect(() => {
+    if (!currentOperator) return;
+    if (activeModule === 'roles' && currentOperator.system_role !== 'ADMIN') {
+      setActiveModule(getFirstAccessibleModule(activeVisibilityPolicy));
+      return;
+    }
+    if (activeVisibilityPolicy?.modules?.[activeModule] === false) {
+      setActiveModule(getFirstAccessibleModule(activeVisibilityPolicy));
+    }
+  }, [currentOperator, activeModule, activeVisibilityPolicy]);
   const profileUser = useMemo(
     () => data.users.find((u) => u.id === Number(profileUserId)) || currentOperator,
     [data.users, profileUserId, currentOperator]
@@ -598,6 +663,7 @@ export default function App() {
         code: deviceForm.code,
         name: deviceForm.name,
         owner_dept_id: Number(deviceForm.owner_dept_id),
+        room_id: deviceForm.room_id ? Number(deviceForm.room_id) : null,
         pos_x: Number(deviceForm.pos_x),
         pos_y: Number(deviceForm.pos_y),
         status: deviceForm.status,
@@ -614,6 +680,134 @@ export default function App() {
       }
       setEditingDeviceId(null);
       setEqPrimaryTab('list');
+      fetchBootstrap();
+    } catch (err) {
+      setNotice({ type: 'error', text: err.message });
+    }
+  };
+
+  const handleSwitchDeviceStatus = async (deviceId, newStatus) => {
+    try {
+      const res = await apiPost(`/api/v1/fms/devices/${deviceId}/status`, {
+        operator_user_id: Number(operatorId),
+        new_status: newStatus,
+      });
+      setNotice({ type: 'success', text: `设备 ${res.code} 已切换为 ${res.status}` });
+      fetchBootstrap();
+    } catch (err) {
+      setNotice({ type: 'error', text: err.message });
+    }
+  };
+
+  const handleSaveRoom = async (roomId, roomPayload) => {
+    try {
+      const body = { operator_user_id: Number(operatorId), ...roomPayload };
+      if (roomId) {
+        const res = await apiPut(`/api/v1/rooms/${roomId}`, body);
+        setNotice({ type: 'success', text: `已更新房间【${res.name}】配置` });
+      } else {
+        const res = await apiPost('/api/v1/rooms', body);
+        setNotice({ type: 'success', text: `已创建数字孪生房间【${res.name}】` });
+      }
+      fetchBootstrap();
+      return true;
+    } catch (err) {
+      setNotice({ type: 'error', text: err.message });
+      return false;
+    }
+  };
+
+  const handleDeleteRoom = async (roomId) => {
+    try {
+      await apiDelete(`/api/v1/rooms/${roomId}?operator_user_id=${operatorId}`);
+      setNotice({ type: 'success', text: '实验房间已删除，原关联设备已自动解除归房' });
+      fetchBootstrap();
+      return true;
+    } catch (err) {
+      setNotice({ type: 'error', text: err.message });
+      return false;
+    }
+  };
+
+  const handleSaveRoomPosition = async (roomId, posX, posY, floor) => {
+    try {
+      await apiPatch(`/api/v1/rooms/${roomId}/position`, {
+        operator_user_id: Number(operatorId),
+        pos_x: posX,
+        pos_y: posY,
+        floor,
+      });
+      fetchBootstrap();
+    } catch (err) {
+      setNotice({ type: 'error', text: err.message });
+    }
+  };
+
+  const handleAssignDiscoveredDevice = async (deviceId, formObj) => {
+    try {
+      const dev = data.devices.find((d) => d.id === deviceId);
+      const res = await apiPut(`/api/v1/fms/devices/${deviceId}`, {
+        operator_user_id: Number(operatorId),
+        code: formObj.code || dev?.code,
+        name: formObj.name,
+        owner_dept_id: Number(formObj.owner_dept_id),
+        room_id: formObj.room_id ? Number(formObj.room_id) : null,
+        pos_x: dev?.pos_x ?? 50,
+        pos_y: dev?.pos_y ?? 50,
+        status: dev?.status ?? 'IDLE',
+        standby_current_threshold: dev?.standby_current_threshold ?? '0.5000',
+        internal_hourly_rate: dev?.internal_hourly_rate ?? '50.0000',
+        external_hourly_rate: dev?.external_hourly_rate ?? '100.0000',
+      });
+      setNotice({ type: 'success', text: `已纳管新硬件节点【${res.name}】并更新平面图拓扑` });
+      fetchBootstrap();
+      return true;
+    } catch (err) {
+      setNotice({ type: 'error', text: err.message });
+      return false;
+    }
+  };
+
+  const handleSaveVisibilityPolicies = async (nextPolicies, nextRolePerms) => {
+    try {
+      const res = await apiPut('/api/v1/system/visibility-policies', {
+        operator_user_id: Number(operatorId),
+        policies: nextPolicies,
+        role_permissions: nextRolePerms,
+      });
+      if (res?.policies) setVisibilityPolicies(res.policies);
+      if (Array.isArray(res?.role_permissions_override)) {
+        setRolesConfig(res.role_permissions_override);
+      }
+      setNotice({ type: 'success', text: '多权限级别可视界面策略与操作权限已保存并全网同步' });
+    } catch (err) {
+      setNotice({ type: 'error', text: err.message });
+    }
+  };
+
+  const handleResetVisibilityPolicies = async () => {
+    try {
+      const res = await apiPost(
+        `/api/v1/system/visibility-policies/reset?operator_user_id=${operatorId}`,
+        {}
+      );
+      if (res?.policies) setVisibilityPolicies(res.policies);
+      setNotice({ type: 'success', text: '已恢复推荐 5 级权限可视预设策略' });
+    } catch (err) {
+      setNotice({ type: 'error', text: err.message });
+    }
+  };
+
+  const handleSaveHardwareSettings = async (settingsObj) => {
+    try {
+      const res = await apiPut('/api/v1/system/hardware-settings', {
+        operator_user_id: Number(operatorId),
+        ...settingsObj,
+      });
+      if (res?.hardware_gateway_settings) {
+        setHwGatewaySettings(res.hardware_gateway_settings);
+      }
+      setNotice({ type: 'success', text: '硬件接入与施密特迟滞参数已保存' });
       fetchBootstrap();
     } catch (err) {
       setNotice({ type: 'error', text: err.message });
@@ -1261,7 +1455,7 @@ export default function App() {
         <nav aria-label="系统主模块">
           {sidebarMode === 'list' ? (
             <ul className="space-y-0.5">
-              {NAV_MODULES.map((m) => {
+              {visibleNavModules.map((m) => {
                 const Icon = m.icon;
                 const active = activeModule === m.id;
                 return (
@@ -1291,7 +1485,7 @@ export default function App() {
             </ul>
           ) : (
             <ul className="grid grid-cols-2 gap-1.5 pt-0.5">
-              {NAV_MODULES.map((m) => {
+              {visibleNavModules.map((m) => {
                 const Icon = m.icon;
                 const active = activeModule === m.id;
                 return (
@@ -1323,29 +1517,32 @@ export default function App() {
         </nav>
       </div>
 
-      {/* 3. 当前项目财务余额卡片 */}
-      <div className="bg-white border border-slate-200 rounded-xl p-3 space-y-1.5 text-[11px] shadow-sm">
-        <div className="font-bold text-slate-900 truncate">
-          {currentProject?.code} · {currentOperator?.home_dept_name}
+      {/* 3. 当前项目财务余额卡片（按权限可视策略控制显隐） */}
+      {activeVisibilityPolicy?.data?.show_sidebar_balance !== false && (
+        <div className="bg-white border border-slate-200 rounded-xl p-3 space-y-1.5 text-[11px] shadow-sm">
+          <div className="font-bold text-slate-900 truncate">
+            {currentProject?.code} · {currentOperator?.home_dept_name}
+          </div>
+          <div className="flex items-center justify-between text-slate-600">
+            <span>可用余额:</span>
+            <strong className="text-emerald-700 font-mono tabular-nums">
+              ¥{currentProject?.available_balance || '0.0000'}
+            </strong>
+          </div>
+          <div className="flex items-center justify-between text-slate-500">
+            <span>预约冻结:</span>
+            <strong className="text-amber-600 font-mono tabular-nums">
+              ¥{currentProject?.frozen_balance || '0.0000'}
+            </strong>
+          </div>
         </div>
-        <div className="flex items-center justify-between text-slate-600">
-          <span>可用余额:</span>
-          <strong className="text-emerald-700 font-mono tabular-nums">
-            ¥{currentProject?.available_balance || '0.0000'}
-          </strong>
-        </div>
-        <div className="flex items-center justify-between text-slate-500">
-          <span>预约冻结:</span>
-          <strong className="text-amber-600 font-mono tabular-nums">
-            ¥{currentProject?.frozen_balance || '0.0000'}
-          </strong>
-        </div>
-      </div>
+      )}
 
-      {/* 4. 快捷入口 */}
+      {/* 4. 快捷入口（仅展示当前角色有权访问的模块） */}
       <div className="bg-white border border-slate-200 rounded-xl divide-y divide-slate-100 text-[11px] overflow-hidden shadow-sm">
         {[
           {
+            module: 'equipments',
             label: '您负责仪器的使用记录',
             action: () => {
               setActiveModule('equipments');
@@ -1353,6 +1550,7 @@ export default function App() {
             },
           },
           {
+            module: 'equipments',
             label: '所有仪器的预约情况',
             action: () => {
               setActiveModule('equipments');
@@ -1360,13 +1558,15 @@ export default function App() {
             },
           },
           {
-            label: '实验室 2D 平面监控',
+            module: 'equipments',
+            label: '实验室 1F/2F/3F 平面监控',
             action: () => {
               setActiveModule('equipments');
               setEqPrimaryTab('map');
             },
           },
           {
+            module: 'billing',
             label: '全平台财务收支明细',
             action: () => {
               setActiveModule('billing');
@@ -1374,13 +1574,16 @@ export default function App() {
             },
           },
           {
+            module: 'samples',
             label: '所有仪器的送样情况',
             action: () => {
               setActiveModule('samples');
               setSamplePrimaryTab('list');
             },
           },
-        ].map((sc) => (
+        ]
+          .filter((sc) => activeVisibilityPolicy?.modules?.[sc.module] !== false)
+          .map((sc) => (
           <button
             key={sc.label}
             type="button"
@@ -1551,13 +1754,18 @@ export default function App() {
               >
                 我的档案
               </button>
-              <button
-                type="button"
-                onClick={() => setActiveModule('roles')}
-                className="hidden sm:inline text-blue-100 hover:text-white hover:underline"
-              >
-                系统设置
-              </button>
+              {currentOperator?.system_role === 'ADMIN' && (
+                <button
+                  type="button"
+                  onClick={() => {
+                    setRolesPrimaryTab('visibility');
+                    setActiveModule('roles');
+                  }}
+                  className="hidden sm:inline text-blue-100 hover:text-white hover:underline"
+                >
+                  系统设置
+                </button>
+              )}
               <button
                 type="button"
                 onClick={() => {
@@ -1650,6 +1858,9 @@ export default function App() {
                 <EquipmentsView
                   data={data}
                   currentOperator={currentOperator}
+                  rolePolicy={activeVisibilityPolicy}
+                  discoveredDevice={discoveredDevice}
+                  onDismissDiscoveredDevice={() => setDiscoveredDevice(null)}
                   eqPrimaryTab={eqPrimaryTab}
                   setEqPrimaryTab={setEqPrimaryTab}
                   eqSecondaryTab={eqSecondaryTab}
@@ -1672,6 +1883,12 @@ export default function App() {
                   onOpenDeviceDetail={openDeviceDetail}
                   onSaveDevice={handleSaveDevice}
                   onRequestDeleteDevice={requestDeleteDevice}
+                  onSwitchDeviceStatus={handleSwitchDeviceStatus}
+                  onSaveRoom={handleSaveRoom}
+                  onDeleteRoom={handleDeleteRoom}
+                  onSaveRoomPosition={handleSaveRoomPosition}
+                  onAssignDiscoveredDevice={handleAssignDiscoveredDevice}
+                  onRequestConfirm={requestConfirm}
                   onCreateReservation={handleCreateReservation}
                   onCheckin={handleCheckin}
                   onCheckout={handleCheckout}
@@ -1728,6 +1945,7 @@ export default function App() {
                 <LabsView
                   data={data}
                   currentOperator={currentOperator}
+                  rolePolicy={activeVisibilityPolicy}
                   currentProject={currentProject}
                   labsPrimaryTab={labsPrimaryTab}
                   setLabsPrimaryTab={setLabsPrimaryTab}
@@ -1783,6 +2001,7 @@ export default function App() {
               {activeModule === 'billing' && (
                 <BillingView
                   data={data}
+                  rolePolicy={activeVisibilityPolicy}
                   billingPrimaryTab={billingPrimaryTab}
                   setBillingPrimaryTab={setBillingPrimaryTab}
                   simErp={simErp}
@@ -1811,6 +2030,8 @@ export default function App() {
 
               {activeModule === 'entrance' && (
                 <EntranceView
+                  data={data}
+                  currentOperator={currentOperator}
                   entranceTab={entranceTab}
                   setEntranceTab={setEntranceTab}
                   hwToken={hwToken}
@@ -1822,26 +2043,33 @@ export default function App() {
                   simIngest={simIngest}
                   setSimIngest={setSimIngest}
                   simResponseLog={simResponseLog}
+                  setSimResponseLog={setSimResponseLog}
                   onTriggerSimRfid={triggerSimRfid}
                   onTriggerSimTelemetry={triggerSimTelemetry}
                   onTriggerSimIngest={triggerSimIngest}
+                  onRefreshBootstrap={fetchBootstrap}
                 />
               )}
 
               {activeModule === 'roles' && (
                 <RolesView
                   data={data}
+                  currentOperator={currentOperator}
                   rolesPrimaryTab={rolesPrimaryTab}
                   setRolesPrimaryTab={setRolesPrimaryTab}
                   rolesConfig={rolesConfig}
                   editingRoleId={editingRoleId}
                   setEditingRoleId={setEditingRoleId}
                   toggleRolePerm={toggleRolePerm}
+                  visibilityPolicies={visibilityPolicies}
+                  setVisibilityPolicies={setVisibilityPolicies}
+                  hwGatewaySettings={hwGatewaySettings}
+                  setHwGatewaySettings={setHwGatewaySettings}
                   roleUpdateForm={roleUpdateForm}
                   setRoleUpdateForm={setRoleUpdateForm}
-                  onSaveRolesNotice={(label) =>
-                    setNotice({ type: 'success', text: `角色【${label}】权限配置已保存` })
-                  }
+                  onSaveVisibilityPolicies={handleSaveVisibilityPolicies}
+                  onResetVisibilityPolicies={handleResetVisibilityPolicies}
+                  onSaveHardwareSettings={handleSaveHardwareSettings}
                   onUpdateUserRole={handleUpdateUserRole}
                 />
               )}

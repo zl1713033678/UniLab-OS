@@ -16,6 +16,7 @@ import {
 export default function LabsView({
   data,
   currentOperator,
+  rolePolicy,
   currentProject,
   labsPrimaryTab,
   setLabsPrimaryTab,
@@ -41,15 +42,18 @@ export default function LabsView({
   onOpenLabDetail,
   onOpenUserProfile,
 }) {
+  const showOrgMgmt = rolePolicy?.data?.show_org_management !== false;
   const tabs = [
     { id: 'list', label: '课题组项目目录', count: data.projects.length },
     { id: 'my_lab', label: '我的课题组' },
     { id: 'add_member', label: '成员配额设置' },
-    { id: 'org_list', label: '组织机构管理', count: data.departments.length },
+    ...(showOrgMgmt
+      ? [{ id: 'org_list', label: '组织机构管理', count: data.departments.length }]
+      : []),
     ...(canCreateProject(currentOperator) || editingProjectId
       ? [{ id: 'upsert_project', label: editingProjectId ? '修改课题组项目' : '新建课题组项目' }]
       : []),
-    ...(canCreateOrg(currentOperator) || editingDeptId
+    ...(showOrgMgmt && (canCreateOrg(currentOperator) || editingDeptId)
       ? [{ id: 'add_org', label: editingDeptId ? '修改组织机构' : '添加组织机构' }]
       : []),
     ...(labsPrimaryTab === 'detail' && selectedLabProject
