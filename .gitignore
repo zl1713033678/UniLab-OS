@@ -6,13 +6,23 @@ __pycache__/
 venv/
 env/
 *.db
+*.db-*
 *.sqlite3
+
+# Secrets & Environment
+.env
+.env.*
+!.env.example
 
 # Node & Vite Frontend
 frontend/node_modules/
 frontend/dist/
 frontend/.vite/
 npm-debug.log*
+
+# Archived legacy docs backup (local only)
+docs/_archive/
+旧文档/
 
 # IDE & OS
 .vscode/
